@@ -3,11 +3,23 @@ FINBERT-based Financial News Sentiment Analyzer
 
 Uses the ProsusAI/finbert model (a BERT model fine-tuned on financial text)
 to classify news text as positive, negative, or neutral.
+
+Enhancements over the base FinBERT wrapper
+------------------------------------------
+* ``SentimentResult`` carries an ``affected_stocks`` list that identifies
+  PSE-listed companies likely impacted by the news item.
+* :meth:`FinBERTAnalyzer.analyze_batch` accepts an optional ``source_texts``
+  argument (the original, un-truncated texts) used for stock matching while
+  the truncated version is fed to the model.
+* A minimum confidence threshold is applied so borderline results are
+  reported as neutral rather than forced into a positive/negative bucket.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+
+from pse_stocks import find_affected_stocks
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +28,10 @@ FINBERT_MODEL = "ProsusAI/finbert"
 
 # Sentiment label mapping returned by FinBERT
 SENTIMENT_LABELS = {"positive", "negative", "neutral"}
+
+# If neither positive nor negative confidence exceeds this threshold the
+# result is reported as neutral regardless of the raw model output.
+MIN_DIRECTIONAL_CONFIDENCE: float = 0.55
 
 
 @dataclass
@@ -26,6 +42,8 @@ class SentimentResult:
     label: str          # 'positive' | 'negative' | 'neutral'
     score: float        # confidence score in [0, 1]
     all_scores: dict    # {'positive': float, 'negative': float, 'neutral': float}
+    affected_stocks: list = field(default_factory=list)
+    """PSE-listed stocks potentially impacted by this news item."""
 
     @property
     def is_positive(self) -> bool:
@@ -87,23 +105,37 @@ class FinBERTAnalyzer:
             text: The text to analyze.
 
         Returns:
-            A :class:`SentimentResult` with label and confidence scores.
+            A :class:`SentimentResult` with label, confidence scores, and
+            a list of potentially affected PSE-listed stocks.
         """
         results = self.analyze_batch([text])
         return results[0]
 
-    def analyze_batch(self, texts: list[str]) -> list[SentimentResult]:
+    def analyze_batch(
+        self,
+        texts: list[str],
+        source_texts: Optional[list[str]] = None,
+    ) -> list[SentimentResult]:
         """
         Analyze the sentiment of multiple texts in batches.
 
         Args:
-            texts: List of texts to analyze.
+            texts: List of texts to analyze.  Long strings will be truncated
+                   before being passed to the model.
+            source_texts: Optional list of *original* (un-truncated) texts
+                          used solely for PSE stock matching.  Must be the same
+                          length as *texts* when provided.  Defaults to *texts*.
 
         Returns:
             List of :class:`SentimentResult` objects in the same order.
+            Each result includes an ``affected_stocks`` list of PSE tickers
+            identified in the corresponding text.
         """
         if not texts:
             return []
+
+        if source_texts is None:
+            source_texts = texts
 
         pipeline = self._get_pipeline()
         results: list[SentimentResult] = []
@@ -111,6 +143,8 @@ class FinBERTAnalyzer:
         # Process in chunks to respect batch_size
         for start in range(0, len(texts), self.batch_size):
             chunk = texts[start : start + self.batch_size]
+            src_chunk = source_texts[start : start + self.batch_size]
+
             # Truncate long texts to avoid exceeding token limits
             truncated = [t[: self.max_length * 4] for t in chunk]
 
@@ -121,15 +155,28 @@ class FinBERTAnalyzer:
                 top_k=None,  # return scores for all labels
             )
 
-            for text, label_scores in zip(chunk, raw_outputs):
+            for text, src_text, label_scores in zip(chunk, src_chunk, raw_outputs):
                 all_scores = {item["label"].lower(): item["score"] for item in label_scores}
                 best = max(label_scores, key=lambda x: x["score"])
+                label = best["label"].lower()
+                score = best["score"]
+
+                # Apply minimum directional confidence: if the winning
+                # label's confidence doesn't clearly clear the threshold,
+                # report as neutral to avoid noisy positive/negative calls.
+                if label in ("positive", "negative") and score < MIN_DIRECTIONAL_CONFIDENCE:
+                    label = "neutral"
+                    score = all_scores.get("neutral", score)
+
+                stocks = find_affected_stocks(src_text)
+
                 results.append(
                     SentimentResult(
                         text=text,
-                        label=best["label"].lower(),
-                        score=best["score"],
+                        label=label,
+                        score=score,
                         all_scores=all_scores,
+                        affected_stocks=stocks,
                     )
                 )
 
