@@ -1618,7 +1618,7 @@ class TestNotifier:
             n.send_signal(self._make_signal())
         mock_post.assert_called_once()
         call_kwargs = mock_post.call_args
-        assert "telegram.org" in call_kwargs[0][0]
+        assert call_kwargs[0][0].startswith("https://api.telegram.org/bot")
 
     def test_send_signal_calls_discord(self):
         from notifier import Notifier
