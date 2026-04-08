@@ -11,8 +11,13 @@ Enhancements over the base FinBERT wrapper
 * :meth:`FinBERTAnalyzer.analyze_batch` accepts an optional ``source_texts``
   argument (the original, un-truncated texts) used for stock matching while
   the truncated version is fed to the model.
-* A minimum confidence threshold is applied so borderline results are
-  reported as neutral rather than forced into a positive/negative bucket.
+* A two-gate noise filter is applied:
+  1. Minimum confidence threshold — borderline results fall back to neutral.
+  2. Minimum margin check — the winning label must lead the runner-up by at
+     least ``MIN_CONFIDENCE_MARGIN`` so that near-tie outputs are not forced
+     into a positive/negative call.
+* Each result includes a ``strength`` field (``"strong"`` / ``"moderate"`` /
+  ``"weak"`` / ``"neutral"``) derived from the winning score and margin.
 """
 
 import logging
@@ -29,9 +34,18 @@ FINBERT_MODEL = "ProsusAI/finbert"
 # Sentiment label mapping returned by FinBERT
 SENTIMENT_LABELS = {"positive", "negative", "neutral"}
 
-# If neither positive nor negative confidence exceeds this threshold the
-# result is reported as neutral regardless of the raw model output.
+# Gate 1 — minimum directional confidence.
+# If the top label's score is below this the result is reported as neutral.
 MIN_DIRECTIONAL_CONFIDENCE: float = 0.55
+
+# Gate 2 — minimum margin between the top label and the runner-up.
+# Prevents near-tie outputs (e.g. pos=0.56, neg=0.44) from generating
+# positive/negative calls.
+MIN_CONFIDENCE_MARGIN: float = 0.15
+
+# Strength thresholds
+_STRONG_THRESHOLD: float = 0.80
+_MODERATE_THRESHOLD: float = 0.65
 
 
 @dataclass
@@ -44,6 +58,8 @@ class SentimentResult:
     all_scores: dict    # {'positive': float, 'negative': float, 'neutral': float}
     affected_stocks: list = field(default_factory=list)
     """PSE-listed stocks potentially impacted by this news item."""
+    strength: str = "neutral"
+    """Signal strength: 'strong' | 'moderate' | 'weak' | 'neutral'."""
 
     @property
     def is_positive(self) -> bool:
@@ -59,7 +75,7 @@ class SentimentResult:
 
     def __str__(self) -> str:
         return (
-            f"[{self.label.upper():8s}  {self.score:.2%}]  "
+            f"[{self.label.upper():8s}  {self.score:.2%}  {self.strength}]  "
             f"{self.text[:80]}{'...' if len(self.text) > 80 else ''}"
         )
 
@@ -157,16 +173,39 @@ class FinBERTAnalyzer:
 
             for text, src_text, label_scores in zip(chunk, src_chunk, raw_outputs):
                 all_scores = {item["label"].lower(): item["score"] for item in label_scores}
-                best = max(label_scores, key=lambda x: x["score"])
+                sorted_scores = sorted(label_scores, key=lambda x: x["score"], reverse=True)
+                best = sorted_scores[0]
                 label = best["label"].lower()
                 score = best["score"]
 
-                # Apply minimum directional confidence: if the winning
+                # Gate 2 requires a runner-up; if the model returned only one
+                # label (unusual but defensive), treat margin as zero.
+                if len(sorted_scores) >= 2:
+                    margin = score - sorted_scores[1]["score"]
+                else:
+                    margin = 0.0
+
+                # Gate 1 — minimum directional confidence: if the winning
                 # label's confidence doesn't clearly clear the threshold,
                 # report as neutral to avoid noisy positive/negative calls.
-                if label in ("positive", "negative") and score < MIN_DIRECTIONAL_CONFIDENCE:
+                # Gate 2 — minimum margin: if the top two labels are too close
+                # together the signal is unreliable; fall back to neutral.
+                if label in ("positive", "negative") and (
+                    score < MIN_DIRECTIONAL_CONFIDENCE
+                    or margin < MIN_CONFIDENCE_MARGIN
+                ):
                     label = "neutral"
                     score = all_scores.get("neutral", score)
+
+                # Compute signal strength from confidence score
+                if label == "neutral":
+                    strength = "neutral"
+                elif score >= _STRONG_THRESHOLD:
+                    strength = "strong"
+                elif score >= _MODERATE_THRESHOLD:
+                    strength = "moderate"
+                else:
+                    strength = "weak"
 
                 stocks = find_affected_stocks(src_text)
 
@@ -177,6 +216,7 @@ class FinBERTAnalyzer:
                         score=score,
                         all_scores=all_scores,
                         affected_stocks=stocks,
+                        strength=strength,
                     )
                 )
 
