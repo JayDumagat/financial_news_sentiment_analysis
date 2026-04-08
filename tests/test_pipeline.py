@@ -278,7 +278,7 @@ class TestMainPipeline:
         report = build_report(articles, results)
         expected_keys = {
             "title", "url", "category", "published_at",
-            "sentiment", "confidence", "score_positive",
+            "sentiment", "strength", "confidence", "score_positive",
             "score_negative", "score_neutral", "analyzed_text",
         }
         assert expected_keys.issubset(report[0].keys())
@@ -739,3 +739,422 @@ class TestRunForever:
         # Article was pre-seeded in DB, so on_new_article should NOT be called
         assert art.url not in seen
 
+
+# ---------------------------------------------------------------------------
+# Sentiment strength / noise-gate tests
+# ---------------------------------------------------------------------------
+
+
+class TestSentimentStrength:
+    def _make_analyzer(self, mock_label="positive", mock_score=0.9, runner_up_score=0.05):
+        from sentiment_analyzer import FinBERTAnalyzer
+
+        def _pipeline(texts, **kwargs):
+            third_score = max(0.0, 1.0 - mock_score - runner_up_score)
+            labels = ["positive", "negative", "neutral"]
+            label_map = {mock_label: mock_score}
+            remaining = [l for l in labels if l != mock_label]
+            label_map[remaining[0]] = runner_up_score
+            label_map[remaining[1]] = third_score
+            return [
+                [{"label": lbl, "score": label_map[lbl]} for lbl in labels]
+                for _ in texts
+            ]
+
+        analyzer = FinBERTAnalyzer()
+        analyzer._pipeline = _pipeline
+        return analyzer
+
+    def test_strong_signal(self):
+        analyzer = self._make_analyzer("positive", 0.90, 0.06)
+        result = analyzer.analyze("Profits soar at BDO after record quarter.")
+        assert result.label == "positive"
+        assert result.strength == "strong"
+
+    def test_moderate_signal(self):
+        analyzer = self._make_analyzer("positive", 0.72, 0.05)
+        result = analyzer.analyze("Revenue slightly above expectations.")
+        assert result.label == "positive"
+        assert result.strength == "moderate"
+
+    def test_weak_signal(self):
+        analyzer = self._make_analyzer("negative", 0.60, 0.05)
+        result = analyzer.analyze("Minor setback for the sector.")
+        assert result.label == "negative"
+        assert result.strength == "weak"
+
+    def test_narrow_margin_falls_back_to_neutral(self):
+        # pos=0.56, neg=0.44 → margin=0.12 < MIN_CONFIDENCE_MARGIN(0.15) → neutral
+        analyzer = self._make_analyzer("positive", 0.56, 0.44)
+        result = analyzer.analyze("The market moved slightly.")
+        assert result.label == "neutral"
+
+    def test_below_min_confidence_falls_back_to_neutral(self):
+        # score=0.52 < MIN_DIRECTIONAL_CONFIDENCE(0.55) → neutral
+        analyzer = self._make_analyzer("positive", 0.52, 0.05)
+        result = analyzer.analyze("Marginal improvement in the index.")
+        assert result.label == "neutral"
+
+    def test_strength_field_present_in_result(self):
+        from sentiment_analyzer import SentimentResult
+
+        r = SentimentResult(
+            text="test",
+            label="positive",
+            score=0.9,
+            all_scores={"positive": 0.9, "negative": 0.05, "neutral": 0.05},
+        )
+        assert hasattr(r, "strength")
+        assert r.strength == "neutral"  # default
+
+    def test_str_includes_strength(self):
+        from sentiment_analyzer import SentimentResult
+
+        r = SentimentResult(
+            text="Big profits!",
+            label="positive",
+            score=0.91,
+            all_scores={"positive": 0.91, "negative": 0.05, "neutral": 0.04},
+            strength="strong",
+        )
+        assert "strong" in str(r)
+
+
+# ---------------------------------------------------------------------------
+# Trading signal tests
+# ---------------------------------------------------------------------------
+
+
+class TestTradingSignals:
+    def _make_result(self, label="positive", score=0.82, strength="strong", stocks=None):
+        from sentiment_analyzer import SentimentResult
+
+        if stocks is None:
+            stocks = [
+                {
+                    "ticker": "BDO",
+                    "name": "BDO Unibank",
+                    "sector": "Financials",
+                    "match_type": "direct",
+                    "matched_keyword": "BDO",
+                }
+            ]
+        return SentimentResult(
+            text="BDO reports record profits.",
+            label=label,
+            score=score,
+            all_scores={"positive": score, "negative": 0.05, "neutral": 0.05},
+            affected_stocks=stocks,
+            strength=strength,
+        )
+
+    def test_positive_sentiment_generates_buy(self):
+        from trading_signals import generate_signals
+
+        result = self._make_result("positive", 0.85, "strong")
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            sigs = generate_signals(result)
+        assert len(sigs) == 1
+        assert sigs[0].signal == "BUY"
+        assert sigs[0].ticker == "BDO"
+
+    def test_negative_sentiment_generates_sell(self):
+        from trading_signals import generate_signals
+
+        result = self._make_result("negative", 0.78, "moderate")
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            sigs = generate_signals(result)
+        assert sigs[0].signal == "SELL"
+
+    def test_neutral_sentiment_generates_hold(self):
+        from trading_signals import generate_signals
+
+        result = self._make_result("neutral", 0.70, "neutral")
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            sigs = generate_signals(result)
+        assert sigs[0].signal == "HOLD"
+
+    def test_prices_computed_when_entry_available(self):
+        from trading_signals import generate_signals
+
+        result = self._make_result("positive", 0.85, "strong")
+        with patch("trading_signals._fetch_latest_price", return_value=100.0):
+            sigs = generate_signals(result)
+        sig = sigs[0]
+        assert sig.entry_price == 100.0
+        assert sig.target_price is not None
+        assert sig.stop_loss is not None
+        assert sig.target_price > sig.entry_price  # BUY: target above entry
+        assert sig.stop_loss < sig.entry_price     # BUY: stop below entry
+
+    def test_sell_prices_direction(self):
+        from trading_signals import generate_signals
+
+        result = self._make_result("negative", 0.82, "strong")
+        with patch("trading_signals._fetch_latest_price", return_value=200.0):
+            sigs = generate_signals(result)
+        sig = sigs[0]
+        assert sig.target_price < sig.entry_price  # SELL: target below entry
+        assert sig.stop_loss > sig.entry_price     # SELL: stop above entry
+
+    def test_no_signals_for_no_stocks(self):
+        from trading_signals import generate_signals
+
+        result = self._make_result("positive", stocks=[])
+        sigs = generate_signals(result)
+        assert sigs == []
+
+    def test_sector_match_downgrades_strength(self):
+        from trading_signals import generate_signals
+
+        stocks = [
+            {
+                "ticker": "MBT",
+                "name": "Metrobank",
+                "sector": "Financials",
+                "match_type": "sector",
+                "matched_keyword": "Financials",
+            }
+        ]
+        result = self._make_result("positive", 0.88, "strong", stocks=stocks)
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            sigs = generate_signals(result)
+        # Sector match on a "strong" sentiment → downgraded to "MODERATE"
+        assert sigs[0].strength == "MODERATE"
+
+    def test_signal_str_representation(self):
+        from trading_signals import TradingSignal
+
+        sig = TradingSignal(
+            ticker="JFC",
+            name="Jollibee Foods",
+            sector="Services",
+            match_type="direct",
+            signal="BUY",
+            strength="STRONG",
+            entry_price=250.0,
+            target_price=258.0,
+            stop_loss=245.0,
+            sentiment_label="positive",
+            sentiment_score=0.88,
+            reasoning="Test reason.",
+        )
+        s = str(sig)
+        assert "BUY" in s
+        assert "JFC" in s
+        assert "250.00" in s
+
+
+# ---------------------------------------------------------------------------
+# Backtester tests
+# ---------------------------------------------------------------------------
+
+
+class TestBacktester:
+    def _make_price_dataframe(self, n=300, start_price=100.0, trend=0.0001):
+        """Build a simple synthetic price DataFrame that mimics yfinance output."""
+        import pandas as pd
+
+        dates = pd.date_range("2023-01-01", periods=n, freq="B")
+        prices = [start_price * (1 + trend) ** i for i in range(n)]
+        df = pd.DataFrame({"Close": prices}, index=dates)
+        return df
+
+    def test_backtest_returns_result_object(self):
+        from backtester import backtest_signal, BacktestResult
+
+        with patch("backtester.yf") as mock_yf:
+            mock_yf.download.return_value = self._make_price_dataframe()
+            result = backtest_signal("BDO", "BUY", holding_days=5, lookback_days=252)
+        assert isinstance(result, BacktestResult)
+        assert result.ticker == "BDO"
+        assert result.signal == "BUY"
+
+    def test_backtest_win_rate_in_range(self):
+        from backtester import backtest_signal
+
+        with patch("backtester.yf") as mock_yf:
+            mock_yf.download.return_value = self._make_price_dataframe(trend=0.001)
+            result = backtest_signal("JFC", "BUY", holding_days=5)
+        assert result.win_rate is not None
+        assert 0.0 <= result.win_rate <= 1.0
+
+    def test_backtest_sell_win_rate_falling_market(self):
+        from backtester import backtest_signal
+
+        with patch("backtester.yf") as mock_yf:
+            mock_yf.download.return_value = self._make_price_dataframe(trend=-0.001)
+            result = backtest_signal("MER", "SELL", holding_days=5)
+        assert result.win_rate is not None
+        # In a consistently falling market, SELL should win most of the time
+        assert result.win_rate > 0.5
+
+    def test_backtest_returns_empty_on_no_data(self):
+        from backtester import backtest_signal
+        import pandas as pd
+
+        with patch("backtester.yf") as mock_yf:
+            mock_yf.download.return_value = pd.DataFrame()
+            result = backtest_signal("FAKE", "BUY")
+        assert result.win_rate is None
+        assert result.current_trend is None
+
+    def test_backtest_trend_uptrend(self):
+        from backtester import backtest_signal
+
+        with patch("backtester.yf") as mock_yf:
+            mock_yf.download.return_value = self._make_price_dataframe(trend=0.002)
+            result = backtest_signal("BDO", "BUY")
+        assert result.current_trend == "UPTREND"
+
+    def test_backtest_trend_downtrend(self):
+        from backtester import backtest_signal
+
+        with patch("backtester.yf") as mock_yf:
+            mock_yf.download.return_value = self._make_price_dataframe(trend=-0.002)
+            result = backtest_signal("BDO", "SELL")
+        assert result.current_trend == "DOWNTREND"
+
+    def test_backtest_summary_string(self):
+        from backtester import BacktestResult
+
+        bt = BacktestResult(
+            ticker="BDO",
+            signal="BUY",
+            holding_days=5,
+            win_rate=0.54,
+            avg_return=0.011,
+            sample_size=240,
+            current_trend="UPTREND",
+            price_vs_ma20=0.025,
+            recent_return_5d=0.012,
+            recent_return_20d=0.031,
+        )
+        s = bt.summary()
+        assert "BDO" in s
+        assert "54.0%" in s
+        assert "UPTREND" in s
+
+    def test_backtest_multiple_signals(self):
+        from backtester import backtest_signals
+
+        with patch("backtester.yf") as mock_yf:
+            mock_yf.download.return_value = self._make_price_dataframe()
+            results = backtest_signals([("BDO", "BUY"), ("JFC", "SELL")])
+        assert len(results) == 2
+
+    def test_backtest_handles_yfinance_not_installed(self):
+        import backtester
+        from backtester import backtest_signal
+
+        with patch.object(backtester, "yf", None):
+            result = backtest_signal("BDO", "BUY")
+        assert result.win_rate is None
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline — signals integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestMainSignalsIntegration:
+    def _make_articles(self, n=2):
+        from scraper import NewsArticle
+
+        return [
+            NewsArticle(
+                title=f"BDO reports strong profit growth Q{i}",
+                url=f"https://www.abs-cbn.com/anc/test-signals-{i}",
+                summary="BDO Unibank posts record net income.",
+                category="Business",
+            )
+            for i in range(n)
+        ]
+
+    def test_build_report_includes_trading_signals(self):
+        from main import build_report
+        from sentiment_analyzer import SentimentResult
+        from trading_signals import TradingSignal
+
+        articles = self._make_articles(1)
+        results = [
+            SentimentResult(
+                text="BDO profits up.",
+                label="positive",
+                score=0.88,
+                all_scores={"positive": 0.88, "negative": 0.07, "neutral": 0.05},
+                strength="strong",
+                affected_stocks=[
+                    {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+                     "match_type": "direct", "matched_keyword": "BDO"}
+                ],
+            )
+        ]
+        sig = TradingSignal(
+            ticker="BDO",
+            name="BDO Unibank",
+            sector="Financials",
+            match_type="direct",
+            signal="BUY",
+            strength="STRONG",
+            entry_price=100.0,
+            target_price=103.0,
+            stop_loss=98.0,
+            sentiment_label="positive",
+            sentiment_score=0.88,
+            reasoning="BDO directly mentioned.",
+        )
+        signals_map = {articles[0].url: [sig]}
+        report = build_report(articles, results, signals_map=signals_map)
+        assert "trading_signals" in report[0]
+        assert len(report[0]["trading_signals"]) == 1
+        assert report[0]["trading_signals"][0]["signal"] == "BUY"
+        assert report[0]["trading_signals"][0]["entry_price"] == 100.0
+
+    def test_parse_args_signals_flags(self):
+        from main import parse_args
+
+        args = parse_args(["--signals", "--backtest", "--holding-days", "10", "--lookback-days", "180"])
+        assert args.signals is True
+        assert args.backtest is True
+        assert args.holding_days == 10
+        assert args.lookback_days == 180
+
+    @patch("main.FinBERTAnalyzer")
+    @patch("main.scrape_anc_news")
+    def test_run_with_signals_flag(self, mock_scrape, MockAnalyzer, tmp_path):
+        from scraper import NewsArticle
+        from sentiment_analyzer import SentimentResult
+        from main import run, parse_args
+
+        articles = [
+            NewsArticle(
+                title="BDO posts record profit",
+                url="https://www.abs-cbn.com/anc/test-signals",
+                summary="BDO Unibank reports profit surge.",
+                category="Business",
+            )
+        ]
+        mock_scrape.return_value = articles
+        mock_results = [
+            SentimentResult(
+                text="BDO profits up.",
+                label="positive",
+                score=0.88,
+                all_scores={"positive": 0.88, "negative": 0.07, "neutral": 0.05},
+                strength="strong",
+                affected_stocks=[
+                    {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+                     "match_type": "direct", "matched_keyword": "BDO"}
+                ],
+            )
+        ]
+        MockAnalyzer.return_value.analyze_batch.return_value = mock_results
+
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            args = parse_args(["--signals"])
+            report = run(args)
+
+        assert len(report) == 1
+        assert "trading_signals" in report[0]
+        assert report[0]["trading_signals"][0]["signal"] == "BUY"

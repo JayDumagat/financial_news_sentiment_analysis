@@ -6,13 +6,21 @@ Orchestrates:
   2. Filtering out non-financial articles (with caching)
   3. Analyzing each article with FinBERT
   4. Reporting which Philippine (PSE-listed) stocks may be affected
-  5. Printing / saving a structured report
-  6. Optionally persisting raw data to a data lake and results to SQLite
+  5. Generating BUY / SELL / HOLD trading signals with entry / target / stop prices
+  6. Optionally backtesting each signal against historical price data
+  7. Printing / saving a structured report
+  8. Optionally persisting raw data to a data lake and results to SQLite
 
 Usage
 -----
     # One-shot run
     python main.py [--max-articles N] [--enrich] [--output results.csv]
+
+    # With trading signals (live price from Yahoo Finance)
+    python main.py --signals
+
+    # With signals + historical backtest (5-day holding period, 1-year window)
+    python main.py --signals --backtest [--holding-days 5] [--lookback-days 252]
 
     # Persist to database and data lake
     python main.py --db news.db --data-lake data_lake/
@@ -28,10 +36,12 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from scraper import NewsArticle, scrape_anc_news, run_forever
 from sentiment_analyzer import FinBERTAnalyzer, SentimentResult
 from relevance_filter import RelevanceFilter
+from trading_signals import generate_signals, TradingSignal
 
 logger = logging.getLogger(__name__)
 
@@ -43,26 +53,69 @@ logger = logging.getLogger(__name__)
 def build_report(
     articles: list[NewsArticle],
     results: list[SentimentResult],
+    signals_map: Optional[dict] = None,
+    backtest_map: Optional[dict] = None,
 ) -> list[dict]:
-    """Merge scraped articles and sentiment results into a list of dicts."""
+    """Merge scraped articles and sentiment results into a list of dicts.
+
+    Args:
+        articles: Scraped news articles.
+        results: Corresponding sentiment results.
+        signals_map: Optional mapping of article URL → list of TradingSignal.
+        backtest_map: Optional mapping of ticker → BacktestResult.
+    """
     report = []
     for article, result in zip(articles, results):
         affected = getattr(result, "affected_stocks", [])
-        report.append(
-            {
-                "title": article.title,
-                "url": article.url,
-                "category": article.category,
-                "published_at": article.published_at or "",
-                "sentiment": result.label,
-                "confidence": round(result.score, 4),
-                "score_positive": round(result.all_scores.get("positive", 0.0), 4),
-                "score_negative": round(result.all_scores.get("negative", 0.0), 4),
-                "score_neutral": round(result.all_scores.get("neutral", 0.0), 4),
-                "analyzed_text": result.text[:200],
-                "affected_stocks": affected,
-            }
-        )
+        sigs = signals_map.get(article.url, []) if signals_map else []
+        row = {
+            "title": article.title,
+            "url": article.url,
+            "category": article.category,
+            "published_at": article.published_at or "",
+            "sentiment": result.label,
+            "strength": result.strength,
+            "confidence": round(result.score, 4),
+            "score_positive": round(result.all_scores.get("positive", 0.0), 4),
+            "score_negative": round(result.all_scores.get("negative", 0.0), 4),
+            "score_neutral": round(result.all_scores.get("neutral", 0.0), 4),
+            "analyzed_text": result.text[:200],
+            "affected_stocks": affected,
+            "trading_signals": [
+                {
+                    "ticker": s.ticker,
+                    "name": s.name,
+                    "signal": s.signal,
+                    "strength": s.strength,
+                    "entry_price": s.entry_price,
+                    "target_price": s.target_price,
+                    "stop_loss": s.stop_loss,
+                    "reasoning": s.reasoning,
+                }
+                for s in sigs
+            ],
+        }
+        if backtest_map:
+            row["backtest_results"] = [
+                {
+                    "ticker": bt.ticker,
+                    "signal": bt.signal,
+                    "holding_days": bt.holding_days,
+                    "win_rate": bt.win_rate,
+                    "avg_return": bt.avg_return,
+                    "sample_size": bt.sample_size,
+                    "current_trend": bt.current_trend,
+                    "price_vs_ma20": bt.price_vs_ma20,
+                    "recent_return_5d": bt.recent_return_5d,
+                    "recent_return_20d": bt.recent_return_20d,
+                }
+                for bt in [
+                    backtest_map[s.ticker]
+                    for s in sigs
+                    if s.ticker in backtest_map and s.signal != "HOLD"
+                ]
+            ]
+        report.append(row)
     return report
 
 
@@ -77,10 +130,12 @@ def print_report(report: list[dict]) -> None:
 
     for i, row in enumerate(report, 1):
         label = row["sentiment"]
+        strength = row.get("strength", "")
         sentiment_counts[label] = sentiment_counts.get(label, 0) + 1
 
         label_icon = {"positive": "✅", "negative": "❌", "neutral": "➖"}.get(label, "❓")
-        print(f"\n[{i:02d}] {label_icon} {label.upper():8s}  ({row['confidence']:.0%} confidence)")
+        strength_tag = f"  [{strength.upper()}]" if strength and strength != "neutral" else ""
+        print(f"\n[{i:02d}] {label_icon} {label.upper():8s}  ({row['confidence']:.0%} confidence){strength_tag}")
         print(f"      {row['title']}")
         print(f"      URL : {row['url']}")
         if row["category"]:
@@ -106,6 +161,45 @@ def print_report(report: list[dict]) -> None:
                 )
                 print(f"      🏢 PSE sectors affected: {sectors}")
 
+        # Trading signals
+        sigs = row.get("trading_signals", [])
+        if sigs:
+            print(f"      {'─' * 60}")
+            print("      📊 TRADING SIGNALS")
+            for sig in sigs:
+                action = sig["signal"]
+                sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action, "")
+                price_str = ""
+                if sig.get("entry_price") is not None:
+                    price_str = (
+                        f"  Entry ₱{sig['entry_price']:.2f}"
+                        + (f" → Target ₱{sig['target_price']:.2f}" if sig.get("target_price") else "")
+                        + (f"  Stop ₱{sig['stop_loss']:.2f}" if sig.get("stop_loss") else "")
+                    )
+                print(
+                    f"      {sig_icon} {action:4s} {sig['ticker']:6s} ({sig['name'][:30]})"
+                    f"  [{sig['strength']}]{price_str}"
+                )
+
+        # Backtest results
+        bts = row.get("backtest_results", [])
+        if bts:
+            print(f"      {'─' * 60}")
+            print("      🔬 BACKTEST (historical price accuracy)")
+            for bt in bts:
+                wr = f"{bt['win_rate']:.1%}" if bt.get("win_rate") is not None else "N/A"
+                avg = f"{bt['avg_return']:+.2%}" if bt.get("avg_return") is not None else "N/A"
+                trend = bt.get("current_trend") or "N/A"
+                r5 = f"{bt['recent_return_5d']:+.2%}" if bt.get("recent_return_5d") is not None else "N/A"
+                r20 = f"{bt['recent_return_20d']:+.2%}" if bt.get("recent_return_20d") is not None else "N/A"
+                n = bt.get("sample_size") or "N/A"
+                hold = bt.get("holding_days", 5)
+                print(
+                    f"      {bt['ticker']:6s} {bt['signal']:4s} | "
+                    f"Win rate: {wr} (n={n}, {hold}d)  Avg return: {avg}  "
+                    f"Trend: {trend}  5d: {r5}  20d: {r20}"
+                )
+
     print("\n" + "-" * 72)
     total = len(report)
     print(
@@ -128,9 +222,11 @@ def save_csv(report: list[dict], path: str) -> None:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for row in report:
-            # Flatten affected_stocks list to a JSON string for CSV compatibility
+            # Flatten list/dict fields to JSON strings for CSV compatibility
             flat_row = dict(row)
-            flat_row["affected_stocks"] = json.dumps(row.get("affected_stocks", []))
+            for list_field in ("affected_stocks", "trading_signals", "backtest_results"):
+                if list_field in flat_row:
+                    flat_row[list_field] = json.dumps(flat_row[list_field])
             writer.writerow(flat_row)
     logger.info("Results saved to %s", output_path)
 
@@ -224,6 +320,38 @@ def parse_args(argv=None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity.",
     )
+    parser.add_argument(
+        "--signals",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate BUY / SELL / HOLD trading signals for affected PSE stocks. "
+            "Requires internet access to fetch live prices from Yahoo Finance."
+        ),
+    )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        default=False,
+        help=(
+            "Run a historical price-based backtest for each generated signal.  "
+            "Implies --signals.  Requires internet access."
+        ),
+    )
+    parser.add_argument(
+        "--holding-days",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Holding period (trading days) used in the backtest (default: 5).",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=252,
+        metavar="N",
+        help="Historical window (calendar days) used in the backtest (default: 252).",
+    )
     return parser.parse_args(argv)
 
 
@@ -247,6 +375,11 @@ def run(args: argparse.Namespace) -> list[dict]:
     db, lake = _build_stores(args)
     relevance = RelevanceFilter(db=db)
     analyzer = FinBERTAnalyzer(model_name=args.model)
+
+    want_signals = getattr(args, "signals", False) or getattr(args, "backtest", False)
+    want_backtest = getattr(args, "backtest", False)
+    holding_days = getattr(args, "holding_days", 5)
+    lookback_days = getattr(args, "lookback_days", 252)
 
     # 1. Scrape
     logger.info("Scraping up to %d articles from ABS-CBN ANC …", args.max_articles)
@@ -309,11 +442,51 @@ def run(args: argparse.Namespace) -> list[dict]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Data lake processed write failed: %s", exc)
 
-    # 7. Report
-    report = build_report(financial_articles, results)
+    # 7. (Optional) Generate trading signals
+    signals_map: dict = {}
+    backtest_map: dict = {}
+
+    if want_signals:
+        logger.info("Generating trading signals …")
+        for article, result in zip(financial_articles, results):
+            sigs = generate_signals(result)
+            signals_map[article.url] = sigs
+
+        if want_backtest:
+            from backtester import backtest_signal
+
+            # Collect unique (ticker, signal) pairs where signal != HOLD
+            seen: set[tuple[str, str]] = set()
+            pairs: list[tuple[str, str]] = []
+            for sigs in signals_map.values():
+                for sig in sigs:
+                    if sig.signal != "HOLD" and (sig.ticker, sig.signal) not in seen:
+                        seen.add((sig.ticker, sig.signal))
+                        pairs.append((sig.ticker, sig.signal))
+
+            if pairs:
+                logger.info(
+                    "Running historical backtest for %d ticker(s) …", len(pairs)
+                )
+                for ticker, signal in pairs:
+                    bt = backtest_signal(
+                        ticker,
+                        signal,
+                        holding_days=holding_days,
+                        lookback_days=lookback_days,
+                    )
+                    backtest_map[ticker] = bt
+
+    # 8. Report
+    report = build_report(
+        financial_articles,
+        results,
+        signals_map=signals_map if want_signals else None,
+        backtest_map=backtest_map if want_backtest else None,
+    )
     print_report(report)
 
-    # 8. (Optional) Save report
+    # 9. (Optional) Save report
     if args.output:
         ext = Path(args.output).suffix.lower()
         if ext == ".json":
