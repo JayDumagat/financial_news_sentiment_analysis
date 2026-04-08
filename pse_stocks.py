@@ -304,6 +304,13 @@ SECTOR_TRIGGERS: dict[str, list[str]] = {
 # Maximum characters of text to scan (title + summary + content prefix)
 _MAX_SCAN_CHARS = 2000
 
+# Pre-compile whole-word regex patterns for each ticker symbol to avoid
+# recompiling on every call to find_affected_stocks.
+_TICKER_PATTERNS: dict[str, re.Pattern] = {
+    ticker: re.compile(r"\b" + re.escape(ticker) + r"\b")
+    for ticker in PSE_COMPANIES
+}
+
 
 def find_affected_stocks(text: str) -> list[dict]:
     """
@@ -337,8 +344,8 @@ def find_affected_stocks(text: str) -> list[dict]:
         if ticker in seen_tickers:
             continue
 
-        # Whole-word ticker match (case-sensitive — tickers are all-caps)
-        if re.search(r"\b" + re.escape(ticker) + r"\b", scan_text):
+        # Whole-word ticker match using pre-compiled pattern
+        if _TICKER_PATTERNS[ticker].search(scan_text):
             results.append(
                 {
                     "ticker": ticker,

@@ -104,6 +104,11 @@ class NewsDatabase:
             self._conn = sqlite3.connect(
                 str(self.db_path),
                 detect_types=sqlite3.PARSE_DECLTYPES,
+                # check_same_thread=False is intentional: the pipeline is
+                # single-threaded; this setting allows the same connection to
+                # be reused across the main thread and any callback threads
+                # (e.g. run_forever's on_new_article). Callers are responsible
+                # for not issuing concurrent writes from multiple threads.
                 check_same_thread=False,
             )
             self._conn.row_factory = sqlite3.Row

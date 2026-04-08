@@ -123,15 +123,15 @@ def save_csv(report: list[dict], path: str) -> None:
         return
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    # Flatten affected_stocks to a JSON string for CSV compatibility
-    flat = [
-        {**row, "affected_stocks": json.dumps(row.get("affected_stocks", []))}
-        for row in report
-    ]
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(flat[0].keys()))
+        fieldnames = list(report[0].keys())
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(flat)
+        for row in report:
+            # Flatten affected_stocks list to a JSON string for CSV compatibility
+            flat_row = dict(row)
+            flat_row["affected_stocks"] = json.dumps(row.get("affected_stocks", []))
+            writer.writerow(flat_row)
     logger.info("Results saved to %s", output_path)
 
 
