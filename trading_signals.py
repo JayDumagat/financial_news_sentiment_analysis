@@ -116,7 +116,7 @@ def _fetch_latest_price(ticker: str) -> Optional[float]:
         import yfinance as yf  # imported here to keep module importable without yfinance
 
         yf_ticker = ticker + _YF_SUFFIX
-        data = yf.download(yf_ticker, period="5d", progress=False, auto_adjust=True)
+        data = yf.download(yf_ticker, period="10d", progress=False, auto_adjust=True)
         if data is None or data.empty:
             logger.debug("No price data returned for %s", yf_ticker)
             return None

@@ -173,7 +173,7 @@ def print_report(report: list[dict]) -> None:
                 if sig.get("entry_price") is not None:
                     price_str = (
                         f"  Entry ₱{sig['entry_price']:.2f}"
-                        + (f" → Target ₱{sig['target_price']:.2f}" if sig.get("target_price") else "")
+                        + (f"  Target ₱{sig['target_price']:.2f}" if sig.get("target_price") else "")
                         + (f"  Stop ₱{sig['stop_loss']:.2f}" if sig.get("stop_loss") else "")
                     )
                 print(

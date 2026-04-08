@@ -169,8 +169,9 @@ def backtest_signal(
         current_trend: Optional[str] = None
 
         if len(close) >= 2:
+            idx_5d = max(-6, -len(close))
             recent_return_5d = float(
-                (close.iloc[-1] - close.iloc[max(-6, -len(close))]) / close.iloc[max(-6, -len(close))]
+                (close.iloc[-1] - close.iloc[idx_5d]) / close.iloc[idx_5d]
             )
         if len(close) >= 21:
             recent_return_20d = float(

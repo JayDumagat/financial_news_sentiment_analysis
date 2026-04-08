@@ -173,7 +173,7 @@ python main.py --signals
 # Generate signals + run historical price backtest
 python main.py --signals --backtest
 
-# Customise backtest holding period and lookback window
+# Customize backtest holding period and lookback window
 python main.py --signals --backtest --holding-days 10 --lookback-days 180
 
 # Limit articles and save to CSV
@@ -244,7 +244,7 @@ options:
       📈 PSE stocks (direct): BDO (BDO Unibank)
       ────────────────────────────────────────────────────────────
       📊 TRADING SIGNALS
-      🟢 BUY  BDO    (BDO Unibank)                [STRONG]  Entry ₱132.50 → Target ₱136.48  Stop ₱129.85
+      🟢 BUY  BDO    (BDO Unibank)                [STRONG]  Entry ₱132.50  Target ₱136.48  Stop ₱129.85
       ────────────────────────────────────────────────────────────
       🔬 BACKTEST (historical price accuracy)
       BDO    BUY  | Win rate: 55.2% (n=247, 5d)  Avg return: +0.78%  Trend: UPTREND  5d: +1.2%  20d: +3.1%

@@ -175,10 +175,15 @@ class FinBERTAnalyzer:
                 all_scores = {item["label"].lower(): item["score"] for item in label_scores}
                 sorted_scores = sorted(label_scores, key=lambda x: x["score"], reverse=True)
                 best = sorted_scores[0]
-                runner_up = sorted_scores[1]
                 label = best["label"].lower()
                 score = best["score"]
-                margin = score - runner_up["score"]
+
+                # Gate 2 requires a runner-up; if the model returned only one
+                # label (unusual but defensive), treat margin as zero.
+                if len(sorted_scores) >= 2:
+                    margin = score - sorted_scores[1]["score"]
+                else:
+                    margin = 0.0
 
                 # Gate 1 — minimum directional confidence: if the winning
                 # label's confidence doesn't clearly clear the threshold,
