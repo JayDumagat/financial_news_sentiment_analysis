@@ -5,11 +5,13 @@ Orchestrates:
   1. Scraping financial news from ABS-CBN ANC
   2. Filtering out non-financial articles (with caching)
   3. Analyzing each article with FinBERT
-  4. Reporting which Philippine (PSE-listed) stocks may be affected
-  5. Generating BUY / SELL / HOLD trading signals with entry / target / stop prices
-  6. Optionally backtesting each signal against historical price data
-  7. Printing / saving a structured report
-  8. Optionally persisting raw data to a data lake and results to SQLite
+  4. Aspect-based sentiment — per-ticker context scoring
+  5. Reporting which Philippine (PSE-listed) stocks may be affected
+  6. Generating BUY / SELL / HOLD trading signals with entry / target / stop prices
+  7. Optionally backtesting each signal against historical price data
+  8. Printing / saving a structured report
+  9. Optionally persisting raw data to a data lake and results to SQLite
+ 10. Sending signals via Telegram or Discord webhook (--telegram-* / --discord-webhook)
 
 Usage
 -----
@@ -27,6 +29,12 @@ Usage
 
     # Watch mode — run forever, poll every 5 minutes
     python main.py --watch [--interval 300] [--db news.db] [--data-lake data_lake/]
+
+    # Send signals to Telegram
+    python main.py --signals --telegram-token <BOT_TOKEN> --telegram-chat-id <CHAT_ID>
+
+    # Send signals to Discord
+    python main.py --signals --discord-webhook <WEBHOOK_URL>
 """
 
 import argparse
@@ -42,6 +50,7 @@ from scraper import NewsArticle, scrape_anc_news, run_forever
 from sentiment_analyzer import FinBERTAnalyzer, SentimentResult
 from relevance_filter import RelevanceFilter
 from trading_signals import generate_signals, TradingSignal
+from notifier import Notifier
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +99,9 @@ def build_report(
                     "entry_price": s.entry_price,
                     "target_price": s.target_price,
                     "stop_loss": s.stop_loss,
+                    "entry_note": s.entry_note,
+                    "atr": s.atr,
+                    "valid_until": s.valid_until.isoformat() if s.valid_until else None,
                     "reasoning": s.reasoning,
                 }
                 for s in sigs
@@ -171,14 +183,21 @@ def print_report(report: list[dict]) -> None:
                 sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action, "")
                 price_str = ""
                 if sig.get("entry_price") is not None:
+                    entry_label = (
+                        "Next Open" if sig.get("entry_note") == "NEXT OPEN" else "Entry"
+                    )
                     price_str = (
-                        f"  Entry ₱{sig['entry_price']:.2f}"
+                        f"  {entry_label} ₱{sig['entry_price']:.2f}"
                         + (f"  Target ₱{sig['target_price']:.2f}" if sig.get("target_price") else "")
                         + (f"  Stop ₱{sig['stop_loss']:.2f}" if sig.get("stop_loss") else "")
+                        + (f"  ATR ₱{sig['atr']:.2f}" if sig.get("atr") else "")
                     )
+                expires = ""
+                if sig.get("valid_until"):
+                    expires = f"  [exp {sig['valid_until'][:16]}]"
                 print(
                     f"      {sig_icon} {action:4s} {sig['ticker']:6s} ({sig['name'][:30]})"
-                    f"  [{sig['strength']}]{price_str}"
+                    f"  [{sig['strength']}]{price_str}{expires}"
                 )
 
         # Backtest results
@@ -352,6 +371,36 @@ def parse_args(argv=None) -> argparse.Namespace:
         metavar="N",
         help="Historical window (calendar days) used in the backtest (default: 252).",
     )
+    parser.add_argument(
+        "--aspects",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable aspect-based sentiment analysis.  Instead of applying one "
+            "article-level sentiment to every matched stock, extract per-ticker "
+            "context snippets and score each one independently."
+        ),
+    )
+    # Telegram webhook
+    parser.add_argument(
+        "--telegram-token",
+        default=None,
+        metavar="TOKEN",
+        help="Telegram bot token for signal notifications.",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        default=None,
+        metavar="CHAT_ID",
+        help="Telegram chat or channel ID to send signal notifications to.",
+    )
+    # Discord webhook
+    parser.add_argument(
+        "--discord-webhook",
+        default=None,
+        metavar="URL",
+        help="Discord Incoming Webhook URL for signal notifications.",
+    )
     return parser.parse_args(argv)
 
 
@@ -375,9 +424,15 @@ def run(args: argparse.Namespace) -> list[dict]:
     db, lake = _build_stores(args)
     relevance = RelevanceFilter(db=db)
     analyzer = FinBERTAnalyzer(model_name=args.model)
+    notifier = Notifier(
+        telegram_token=getattr(args, "telegram_token", None),
+        telegram_chat_id=getattr(args, "telegram_chat_id", None),
+        discord_webhook=getattr(args, "discord_webhook", None),
+    )
 
     want_signals = getattr(args, "signals", False) or getattr(args, "backtest", False)
     want_backtest = getattr(args, "backtest", False)
+    want_aspects = getattr(args, "aspects", False)
     holding_days = getattr(args, "holding_days", 5)
     lookback_days = getattr(args, "lookback_days", 252)
 
@@ -427,6 +482,15 @@ def run(args: argparse.Namespace) -> list[dict]:
     logger.info("Running FinBERT sentiment analysis on %d article(s) …", len(texts))
     results = analyzer.analyze_batch(texts, source_texts=source_texts)
 
+    # 5b. Aspect-based per-ticker sentiment enrichment
+    if want_aspects:
+        logger.info("Running aspect-based sentiment analysis …")
+        for result, src in zip(results, source_texts):
+            if result.affected_stocks:
+                result.affected_stocks = analyzer.analyze_aspects(
+                    src, stocks=result.affected_stocks
+                )
+
     # 6. Save sentiment results
     if db is not None:
         for article, result in zip(financial_articles, results):
@@ -449,8 +513,21 @@ def run(args: argparse.Namespace) -> list[dict]:
     if want_signals:
         logger.info("Generating trading signals …")
         for article, result in zip(financial_articles, results):
-            sigs = generate_signals(result)
+            # Parse published_at for valid_until calculation
+            pub_dt: Optional[datetime] = None
+            if article.published_at:
+                try:
+                    pub_dt = datetime.fromisoformat(article.published_at)
+                except ValueError:
+                    pass
+            sigs = generate_signals(result, published_at=pub_dt)
             signals_map[article.url] = sigs
+
+            # Notify each actionable signal
+            if notifier.is_configured:
+                for sig in sigs:
+                    if sig.signal != "HOLD":
+                        notifier.send_signal(sig)
 
         if want_backtest:
             from backtester import backtest_signal
@@ -502,6 +579,13 @@ def _watch(args: argparse.Namespace) -> None:
     db, lake = _build_stores(args)
     relevance = RelevanceFilter(db=db)
     analyzer = FinBERTAnalyzer(model_name=args.model)
+    notifier = Notifier(
+        telegram_token=getattr(args, "telegram_token", None),
+        telegram_chat_id=getattr(args, "telegram_chat_id", None),
+        discord_webhook=getattr(args, "discord_webhook", None),
+    )
+    want_signals = getattr(args, "signals", False)
+    want_aspects = getattr(args, "aspects", False)
 
     def _process(article: NewsArticle) -> None:
         if not relevance.is_financial(article):
@@ -514,6 +598,11 @@ def _watch(args: argparse.Namespace) -> None:
         ]
         results = analyzer.analyze_batch(texts, source_texts=source_texts)
         result = results[0]
+
+        if want_aspects and result.affected_stocks:
+            result.affected_stocks = analyzer.analyze_aspects(
+                source_texts[0], stocks=result.affected_stocks
+            )
 
         if db is not None:
             try:
@@ -537,6 +626,19 @@ def _watch(args: argparse.Namespace) -> None:
             f"{article.title[:60]}{'…' if len(article.title) > 60 else ''}"
             + (f"  |  PSE: {tickers}" if tickers else "")
         )
+
+        # Send webhook notifications for actionable signals
+        if want_signals and notifier.is_configured:
+            pub_dt: Optional[datetime] = None
+            if article.published_at:
+                try:
+                    pub_dt = datetime.fromisoformat(article.published_at)
+                except ValueError:
+                    pass
+            sigs = generate_signals(result, published_at=pub_dt)
+            for sig in sigs:
+                if sig.signal != "HOLD":
+                    notifier.send_signal(sig)
 
     run_forever(
         poll_interval=args.interval,

@@ -18,9 +18,15 @@ Enhancements over the base FinBERT wrapper
      into a positive/negative call.
 * Each result includes a ``strength`` field (``"strong"`` / ``"moderate"`` /
   ``"weak"`` / ``"neutral"``) derived from the winning score and margin.
+* **Aspect-based sentiment** — :meth:`FinBERTAnalyzer.analyze_aspects` scores
+  the sentiment for each PSE ticker *individually* by extracting the sentences
+  that mention that ticker and analysing only that context.  This avoids the
+  conglomerate problem where a positive BDO article incorrectly influences the
+  sentiment of every other bank triggered by a sector keyword.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -221,6 +227,89 @@ class FinBERTAnalyzer:
                 )
 
         return results
+
+    def analyze_aspects(
+        self,
+        text: str,
+        stocks: Optional[list[dict]] = None,
+        context_chars: int = 400,
+    ) -> list[dict]:
+        """Perform aspect-based sentiment analysis — one score per PSE ticker.
+
+        Instead of applying a single sentiment score to the entire article
+        (which can be misleading for conglomerates), this method:
+
+        1. For each stock in *stocks* (or from :func:`~pse_stocks.find_affected_stocks`),
+           extracts the sentences / window of text that **directly mention** that
+           ticker or its company name.
+        2. Runs FinBERT on each ticker-specific context snippet.
+        3. Attaches the per-ticker sentiment as ``aspect_label``,
+           ``aspect_score``, and ``aspect_strength`` keys on the stock dict.
+
+        Stocks for which no direct mention is found receive the article-level
+        sentiment as a fallback (same as before), clearly marked with
+        ``aspect_source = "article"``.
+
+        Args:
+            text: Full article text (un-truncated).
+            stocks: List of stock dicts as returned by
+                    :func:`~pse_stocks.find_affected_stocks`.  When ``None``
+                    the stocks are detected automatically.
+            context_chars: Characters of text to extract around each ticker
+                           mention (default 400 — roughly 2–3 sentences).
+
+        Returns:
+            A copy of *stocks* with ``aspect_label``, ``aspect_score``,
+            ``aspect_strength``, and ``aspect_source`` fields added.
+        """
+        if stocks is None:
+            stocks = find_affected_stocks(text)
+
+        if not stocks:
+            return stocks
+
+        # Article-level sentiment used as fallback
+        article_result = self.analyze(text)
+
+        enriched: list[dict] = []
+        for stock in stocks:
+            stock_copy = dict(stock)
+
+            # Collect mention keywords for this stock
+            from pse_stocks import PSE_COMPANIES  # noqa: PLC0415
+
+            ticker = stock["ticker"]
+            info = PSE_COMPANIES.get(ticker, {})
+            keywords = [ticker] + list(info.get("keywords", []))
+
+            # Extract context windows around each mention
+            snippets: list[str] = []
+            for kw in keywords:
+                for m in re.finditer(re.escape(kw), text, re.IGNORECASE):
+                    start = max(0, m.start() - context_chars // 2)
+                    end = min(len(text), m.end() + context_chars // 2)
+                    snippets.append(text[start:end])
+                if snippets:
+                    break  # stop at first keyword that has hits
+
+            if snippets:
+                # Deduplicate overlapping snippets by joining them
+                context = " … ".join(dict.fromkeys(snippets))
+                aspect_result = self.analyze(context)
+                stock_copy["aspect_label"] = aspect_result.label
+                stock_copy["aspect_score"] = aspect_result.score
+                stock_copy["aspect_strength"] = aspect_result.strength
+                stock_copy["aspect_source"] = "direct"
+            else:
+                # No direct mention — use article-level sentiment
+                stock_copy["aspect_label"] = article_result.label
+                stock_copy["aspect_score"] = article_result.score
+                stock_copy["aspect_strength"] = article_result.strength
+                stock_copy["aspect_source"] = "article"
+
+            enriched.append(stock_copy)
+
+        return enriched
 
     # ------------------------------------------------------------------
     # Private helpers
