@@ -1,0 +1,11 @@
+# Core scraping dependencies
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# FinBERT / HuggingFace
+transformers>=4.36.0
+torch>=2.1.0
+
+# Testing
+pytest>=7.4.0
