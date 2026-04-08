@@ -3,16 +3,30 @@ ABS-CBN ANC Financial News Scraper
 
 Scrapes financial/business news articles from the ABS-CBN ANC website
 (https://www.abs-cbn.com/anc/anc).
+
+Watch / daemon mode
+-------------------
+:func:`run_forever` polls the news listing on a configurable interval,
+saves new articles to the optional database and data lake, and runs
+until interrupted (SIGINT / SIGTERM).  It intentionally does *not*
+scrape aggressively — a minimum :data:`REQUEST_DELAY` is always
+observed between HTTP requests, and a configurable inter-poll interval
+prevents hammering the target server.
 """
 
+import signal
 import time
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import requests
 from bs4 import BeautifulSoup
+
+if TYPE_CHECKING:
+    from database import NewsDatabase
+    from data_lake import DataLake
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +273,114 @@ def scrape_anc_news(max_articles: int = 20, enrich: bool = False) -> list[NewsAr
             scraper.enrich_article(article)
 
     return articles
+
+
+def run_forever(
+    poll_interval: int = 300,
+    max_articles: int = 20,
+    enrich: bool = False,
+    db: "Optional[NewsDatabase]" = None,
+    data_lake: "Optional[DataLake]" = None,
+    on_new_article=None,
+) -> None:
+    """
+    Poll ABS-CBN ANC for new articles indefinitely.
+
+    New articles (URLs not yet seen in *db* or the in-memory seen set) are
+    saved to the database and data lake when those stores are provided, and
+    passed to *on_new_article* for further processing.
+
+    The function returns only when interrupted via SIGINT or SIGTERM.
+
+    Args:
+        poll_interval: Seconds to wait between successive scraping rounds.
+                       Defaults to 300 s (5 minutes).  The effective delay
+                       between individual HTTP requests is always at least
+                       :data:`REQUEST_DELAY`.
+        max_articles:  Number of articles to fetch per poll round.
+        enrich:        Fetch the full article body on each new article.
+        db:            Optional :class:`~database.NewsDatabase` instance.
+                       Used to track seen URLs across process restarts.
+        data_lake:     Optional :class:`~data_lake.DataLake` instance.
+                       New raw articles are persisted here.
+        on_new_article: Optional callable ``(article: NewsArticle) -> None``
+                        invoked for every genuinely new article.
+    """
+    scraper = ANCNewsScraper()
+    seen_urls: set[str] = set()
+    _stop = {"flag": False}
+
+    def _handle_signal(signum, frame):  # noqa: ANN001
+        logger.info("Received signal %s — stopping watch loop.", signum)
+        _stop["flag"] = True
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    logger.info(
+        "Watch mode started.  Polling every %d s for up to %d articles.",
+        poll_interval,
+        max_articles,
+    )
+
+    while not _stop["flag"]:
+        try:
+            articles = scraper.get_articles(max_articles=max_articles)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error during scraping: %s", exc)
+            articles = []
+
+        new_articles: list[NewsArticle] = []
+        for article in articles:
+            already_seen = article.url in seen_urls or (
+                db is not None and db.is_seen(article.url)
+            )
+            if already_seen:
+                continue
+
+            seen_urls.add(article.url)
+
+            if enrich:
+                scraper.enrich_article(article)
+
+            # Persist raw article to the data lake
+            if data_lake is not None:
+                try:
+                    data_lake.save_raw_article(article)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Data lake write failed: %s", exc)
+
+            # Save to database (relevance flag determined later by pipeline)
+            if db is not None:
+                try:
+                    db.save_article(article)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("DB write failed: %s", exc)
+
+            new_articles.append(article)
+
+        if new_articles:
+            logger.info("Watch: %d new article(s) found.", len(new_articles))
+            if on_new_article is not None:
+                for article in new_articles:
+                    try:
+                        on_new_article(article)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("on_new_article callback raised: %s", exc)
+        else:
+            logger.debug("Watch: no new articles this round.")
+
+        if _stop["flag"]:
+            break
+
+        # Politely wait before the next round
+        logger.debug("Watch: sleeping %d s until next poll …", poll_interval)
+        for _ in range(poll_interval):
+            if _stop["flag"]:
+                break
+            time.sleep(1)
+
+    logger.info("Watch mode stopped.")
 
 
 if __name__ == "__main__":
