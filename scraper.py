@@ -32,15 +32,38 @@ logger = logging.getLogger(__name__)
 
 ANC_URL = "https://www.abs-cbn.com/anc/anc"
 ANC_BUSINESS_URL = "https://www.abs-cbn.com/anc/business"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+
+# Fallback static User-Agent used when fake-useragent is not installed
+_FALLBACK_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 REQUEST_DELAY = 1.5  # seconds between requests to be polite
+
+
+def _get_random_ua() -> str:
+    """Return a random browser User-Agent string.
+
+    Uses the ``fake-useragent`` library when available so that the scraper
+    does not present an obviously static header to the target server.
+    Falls back gracefully to a hard-coded Chrome string if the library is
+    not installed.
+    """
+    try:
+        from fake_useragent import UserAgent  # type: ignore[import]
+
+        return UserAgent().random
+    except Exception:  # library absent or network error during UA update
+        return _FALLBACK_UA
+
+
+def _build_headers() -> dict:
+    return {
+        "User-Agent": _get_random_ua(),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
 
 @dataclass
@@ -83,7 +106,7 @@ class ANCNewsScraper:
     def __init__(self, delay: float = REQUEST_DELAY):
         self.delay = delay
         self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+        self.session.headers.update(_build_headers())
 
     # ------------------------------------------------------------------
     # Public API

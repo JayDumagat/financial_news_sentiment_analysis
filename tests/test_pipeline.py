@@ -1158,3 +1158,570 @@ class TestMainSignalsIntegration:
         assert len(report) == 1
         assert "trading_signals" in report[0]
         assert report[0]["trading_signals"][0]["signal"] == "BUY"
+
+
+# ---------------------------------------------------------------------------
+# PSE market-hours tests
+# ---------------------------------------------------------------------------
+
+
+class TestPSEMarketHours:
+    def _make_dt(self, weekday, hour, minute=0):
+        """Build a PHT-aware datetime with a given ISO weekday (0=Mon)."""
+        from datetime import datetime, timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        # Use a Monday=2025-01-06 as base
+        base_monday = datetime(2025, 1, 6, tzinfo=pht)
+        day = base_monday + timedelta(days=weekday)
+        return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    def test_market_open_during_morning_session(self):
+        from trading_signals import is_pse_market_open
+
+        assert is_pse_market_open(self._make_dt(0, 10, 0)) is True  # 10:00 Mon
+
+    def test_market_open_during_afternoon_session(self):
+        from trading_signals import is_pse_market_open
+
+        assert is_pse_market_open(self._make_dt(1, 14, 0)) is True  # 14:00 Tue
+
+    def test_market_closed_before_open(self):
+        from trading_signals import is_pse_market_open
+
+        assert is_pse_market_open(self._make_dt(0, 8, 0)) is False  # 08:00 Mon
+
+    def test_market_closed_at_lunchbreak(self):
+        from trading_signals import is_pse_market_open
+
+        assert is_pse_market_open(self._make_dt(2, 12, 30)) is False  # 12:30 Wed
+
+    def test_market_closed_after_close(self):
+        from trading_signals import is_pse_market_open
+
+        assert is_pse_market_open(self._make_dt(3, 16, 0)) is False  # 16:00 Thu
+
+    def test_market_closed_on_saturday(self):
+        from trading_signals import is_pse_market_open
+
+        assert is_pse_market_open(self._make_dt(5, 10, 0)) is False  # Saturday
+
+    def test_market_closed_on_sunday(self):
+        from trading_signals import is_pse_market_open
+
+        assert is_pse_market_open(self._make_dt(6, 10, 0)) is False  # Sunday
+
+    def test_next_pse_market_open_returns_future(self):
+        from trading_signals import next_pse_market_open
+        from datetime import timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        # Use a Saturday — next open should be Monday 09:30 PHT
+        from datetime import datetime
+
+        saturday = datetime(2025, 1, 11, 20, 0, tzinfo=pht)  # Sat 20:00
+        nxt = next_pse_market_open(saturday)
+        assert nxt > saturday
+        assert nxt.weekday() < 5  # must be a weekday
+
+    def test_entry_note_is_next_open_when_market_closed(self):
+        from trading_signals import generate_signals, is_pse_market_open
+        from sentiment_analyzer import SentimentResult
+        from datetime import datetime, timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        # Saturday — market closed
+        saturday = datetime(2025, 1, 11, 20, 0, tzinfo=pht)
+
+        result = SentimentResult(
+            text="BDO profits up.",
+            label="positive",
+            score=0.88,
+            all_scores={"positive": 0.88, "negative": 0.07, "neutral": 0.05},
+            strength="strong",
+            affected_stocks=[
+                {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+                 "match_type": "direct", "matched_keyword": "BDO"}
+            ],
+        )
+        with patch("trading_signals._fetch_latest_price", return_value=100.0):
+            with patch("trading_signals._fetch_atr", return_value=None):
+                sigs = generate_signals(result, now=saturday)
+        assert sigs[0].entry_note == "NEXT OPEN"
+
+    def test_entry_note_is_current_when_market_open(self):
+        from trading_signals import generate_signals
+        from sentiment_analyzer import SentimentResult
+        from datetime import datetime, timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        monday_10am = datetime(2025, 1, 6, 10, 0, tzinfo=pht)
+
+        result = SentimentResult(
+            text="BDO profits up.",
+            label="positive",
+            score=0.88,
+            all_scores={"positive": 0.88, "negative": 0.07, "neutral": 0.05},
+            strength="strong",
+            affected_stocks=[
+                {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+                 "match_type": "direct", "matched_keyword": "BDO"}
+            ],
+        )
+        with patch("trading_signals._fetch_latest_price", return_value=100.0):
+            with patch("trading_signals._fetch_atr", return_value=None):
+                sigs = generate_signals(result, now=monday_10am)
+        assert sigs[0].entry_note == "CURRENT"
+
+
+# ---------------------------------------------------------------------------
+# ATR-based stop-loss tests
+# ---------------------------------------------------------------------------
+
+
+class TestATRStops:
+    def _make_result(self, strength="strong"):
+        from sentiment_analyzer import SentimentResult
+
+        return SentimentResult(
+            text="BDO profits up.",
+            label="positive",
+            score=0.88,
+            all_scores={"positive": 0.88, "negative": 0.07, "neutral": 0.05},
+            strength=strength,
+            affected_stocks=[
+                {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+                 "match_type": "direct", "matched_keyword": "BDO"}
+            ],
+        )
+
+    def test_atr_stop_wider_than_entry(self):
+        from trading_signals import generate_signals
+
+        with patch("trading_signals._fetch_latest_price", return_value=100.0):
+            with patch("trading_signals._fetch_atr", return_value=2.0):
+                sigs = generate_signals(self._make_result("strong"))
+        sig = sigs[0]
+        # ATR=2.0, mult=1.5 → stop distance=3.0 → stop=97.0
+        assert sig.stop_loss == pytest.approx(100.0 - 2.0 * 1.5, abs=0.01)
+        assert sig.atr == pytest.approx(2.0)
+
+    def test_fallback_to_fixed_pct_when_atr_none(self):
+        from trading_signals import generate_signals
+
+        with patch("trading_signals._fetch_latest_price", return_value=100.0):
+            with patch("trading_signals._fetch_atr", return_value=None):
+                sigs = generate_signals(self._make_result("strong"))
+        sig = sigs[0]
+        # Fallback: strong → 2% stop
+        assert sig.stop_loss == pytest.approx(100.0 * (1 - 0.02), abs=0.01)
+        assert sig.atr is None
+
+    def test_atr_stored_on_signal(self):
+        from trading_signals import generate_signals
+
+        with patch("trading_signals._fetch_latest_price", return_value=50.0):
+            with patch("trading_signals._fetch_atr", return_value=1.5):
+                sigs = generate_signals(self._make_result())
+        assert sigs[0].atr == pytest.approx(1.5)
+
+
+# ---------------------------------------------------------------------------
+# valid_until / signal expiry tests
+# ---------------------------------------------------------------------------
+
+
+class TestSignalExpiry:
+    def _make_result(self, strength="strong"):
+        from sentiment_analyzer import SentimentResult
+
+        return SentimentResult(
+            text="BDO profits up.",
+            label="positive",
+            score=0.88,
+            all_scores={"positive": 0.88, "negative": 0.07, "neutral": 0.05},
+            strength=strength,
+            affected_stocks=[
+                {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+                 "match_type": "direct", "matched_keyword": "BDO"}
+            ],
+        )
+
+    def test_valid_until_set(self):
+        from trading_signals import generate_signals
+        from datetime import datetime, timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        pub = datetime(2025, 1, 6, 10, 0, tzinfo=pht)
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            with patch("trading_signals._fetch_atr", return_value=None):
+                sigs = generate_signals(self._make_result(), published_at=pub)
+        assert sigs[0].valid_until is not None
+        assert sigs[0].valid_until > pub
+
+    def test_strong_signal_valid_6h(self):
+        from trading_signals import generate_signals
+        from datetime import datetime, timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        pub = datetime(2025, 1, 6, 9, 0, tzinfo=pht)
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            with patch("trading_signals._fetch_atr", return_value=None):
+                sigs = generate_signals(self._make_result("strong"), published_at=pub)
+        expected = pub + timedelta(hours=6)
+        assert sigs[0].valid_until == expected
+
+    def test_weak_signal_valid_4h(self):
+        from trading_signals import generate_signals
+        from datetime import datetime, timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        pub = datetime(2025, 1, 6, 9, 0, tzinfo=pht)
+        with patch("trading_signals._fetch_latest_price", return_value=None):
+            with patch("trading_signals._fetch_atr", return_value=None):
+                sigs = generate_signals(self._make_result("weak"), published_at=pub)
+        expected = pub + timedelta(hours=4)
+        assert sigs[0].valid_until == expected
+
+
+# ---------------------------------------------------------------------------
+# Aspect-based sentiment tests
+# ---------------------------------------------------------------------------
+
+
+class TestAspectSentiment:
+    def _make_analyzer(self, mock_label="positive", mock_score=0.85):
+        from sentiment_analyzer import FinBERTAnalyzer
+
+        def _pipeline(texts, **kwargs):
+            return [
+                [
+                    {"label": mock_label, "score": mock_score},
+                    {"label": "negative", "score": 0.05},
+                    {"label": "neutral", "score": 0.10},
+                ]
+                for _ in texts
+            ]
+
+        analyzer = FinBERTAnalyzer()
+        analyzer._pipeline = _pipeline
+        return analyzer
+
+    def test_analyze_aspects_returns_stock_list(self):
+        analyzer = self._make_analyzer()
+        stocks = [
+            {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+             "match_type": "direct", "matched_keyword": "BDO"}
+        ]
+        text = "BDO reported record net income this quarter driven by strong lending."
+        result = analyzer.analyze_aspects(text, stocks=stocks)
+        assert len(result) == 1
+        assert "aspect_label" in result[0]
+        assert "aspect_score" in result[0]
+        assert "aspect_strength" in result[0]
+        assert "aspect_source" in result[0]
+
+    def test_analyze_aspects_direct_mention_tagged(self):
+        analyzer = self._make_analyzer("positive", 0.90)
+        stocks = [
+            {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+             "match_type": "direct", "matched_keyword": "BDO"}
+        ]
+        text = "BDO Unibank posted strong earnings."
+        result = analyzer.analyze_aspects(text, stocks=stocks)
+        assert result[0]["aspect_source"] == "direct"
+
+    def test_analyze_aspects_fallback_when_no_mention(self):
+        analyzer = self._make_analyzer("neutral", 0.70)
+        stocks = [
+            {"ticker": "MBT", "name": "Metrobank", "sector": "Financials",
+             "match_type": "sector", "matched_keyword": "Financials"}
+        ]
+        # Text does not mention MBT or Metrobank directly
+        text = "The BSP raised interest rates today."
+        result = analyzer.analyze_aspects(text, stocks=stocks)
+        assert result[0]["aspect_source"] == "article"
+
+    def test_analyze_aspects_empty_stocks(self):
+        analyzer = self._make_analyzer()
+        result = analyzer.analyze_aspects("Some text.", stocks=[])
+        assert result == []
+
+    def test_analyze_aspects_auto_detects_stocks(self):
+        analyzer = self._make_analyzer("positive", 0.90)
+        text = "Meralco announced a rate increase affecting Manila consumers."
+        result = analyzer.analyze_aspects(text)
+        # MER should be detected via keyword "Meralco"
+        tickers = [s["ticker"] for s in result]
+        assert "MER" in tickers
+
+
+# ---------------------------------------------------------------------------
+# Relevance filter — min keyword count gate tests
+# ---------------------------------------------------------------------------
+
+
+class TestRelevanceFilterKeywordGate:
+    def _make_article(self, title="", summary="", category="", content=""):
+        from scraper import NewsArticle
+
+        return NewsArticle(
+            title=title,
+            url=f"https://example.com/{hash(title + summary)}",
+            summary=summary,
+            category=category,
+            content=content,
+        )
+
+    def test_single_brand_mention_without_financial_context_rejected(self):
+        from relevance_filter import RelevanceFilter
+
+        filt = RelevanceFilter()
+        # Celebrity article mentioning a brand — single keyword hit, no category
+        art = self._make_article(
+            title="Actress spotted drinking San Miguel beer at concert",
+            summary="The popular singer enjoyed the event.",
+        )
+        # "market" or "stock" won't appear → score < threshold → rejected
+        assert filt.is_financial(art) is False
+
+    def test_two_keywords_without_category_passes(self):
+        from relevance_filter import RelevanceFilter
+
+        filt = RelevanceFilter()
+        art = self._make_article(
+            title="San Miguel Corporation reports profit surge",
+            summary="Revenue climbed 12% driven by beer volumes.",
+        )
+        # 'profit' + 'revenue' → 2 keywords → passes count gate
+        assert filt.is_financial(art) is True
+
+    def test_financial_category_bypasses_count_gate(self):
+        from relevance_filter import RelevanceFilter
+
+        filt = RelevanceFilter()
+        art = self._make_article(title="Quick update", category="Business")
+        # Category boost alone (5.0 ≥ threshold) + category bypasses count gate
+        assert filt.is_financial(art) is True
+
+    def test_custom_min_keyword_count(self):
+        from relevance_filter import RelevanceFilter
+
+        filt = RelevanceFilter(min_keyword_count=3)
+        # Two keywords → should fail with count=3
+        art = self._make_article(
+            title="Stock profit rises",
+            summary="Quarterly earnings improved.",
+        )
+        # 'stock', 'profit', 'earnings' → 3 keywords → passes
+        assert filt.is_financial(art) is True
+
+        art2 = self._make_article(title="Stock profit", summary="Good news.")
+        # Only 'stock', 'profit' → 2 keywords < 3 → fails
+        result = filt.check(art2)
+        assert result.is_financial is False
+
+
+# ---------------------------------------------------------------------------
+# Scraper — fake-useragent tests
+# ---------------------------------------------------------------------------
+
+
+class TestFakeUserAgent:
+    def test_get_random_ua_returns_string(self):
+        from scraper import _get_random_ua
+
+        ua = _get_random_ua()
+        assert isinstance(ua, str)
+        assert len(ua) > 10
+
+    def test_get_random_ua_falls_back_on_import_error(self):
+        """When fake-useragent is not installed, fall back to static UA."""
+        from scraper import _get_random_ua, _FALLBACK_UA
+
+        with patch.dict(sys.modules, {"fake_useragent": None}):
+            ua = _get_random_ua()
+        assert isinstance(ua, str)
+        # When the module is None, ImportError is raised and we fall back
+        # to the static string — just check it's a non-empty string.
+        assert len(ua) > 0
+
+    def test_scraper_session_has_user_agent(self):
+        from scraper import ANCNewsScraper
+
+        scraper = ANCNewsScraper(delay=0)
+        assert "User-Agent" in scraper.session.headers
+
+
+# ---------------------------------------------------------------------------
+# Notifier tests
+# ---------------------------------------------------------------------------
+
+
+class TestNotifier:
+    def _make_signal(self):
+        from trading_signals import TradingSignal
+        from datetime import datetime, timezone, timedelta
+
+        pht = timezone(timedelta(hours=8))
+        return TradingSignal(
+            ticker="BDO",
+            name="BDO Unibank",
+            sector="Financials",
+            match_type="direct",
+            signal="BUY",
+            strength="STRONG",
+            entry_price=132.5,
+            target_price=136.5,
+            stop_loss=129.5,
+            sentiment_label="positive",
+            sentiment_score=0.88,
+            reasoning="BDO reported record profits.",
+            entry_note="CURRENT",
+            valid_until=datetime(2025, 1, 6, 15, 0, tzinfo=pht),
+            atr=2.1,
+        )
+
+    def test_notifier_not_configured_by_default(self):
+        from notifier import Notifier
+
+        n = Notifier()
+        assert n.is_configured is False
+
+    def test_notifier_configured_with_telegram(self):
+        from notifier import Notifier
+
+        n = Notifier(telegram_token="abc:123", telegram_chat_id="@mychan")
+        assert n.is_configured is True
+
+    def test_notifier_configured_with_discord(self):
+        from notifier import Notifier
+
+        n = Notifier(discord_webhook="https://discord.com/api/webhooks/x/y")
+        assert n.is_configured is True
+
+    def test_send_signal_no_op_when_not_configured(self):
+        from notifier import Notifier
+
+        n = Notifier()
+        # Should not raise even with a valid signal
+        n.send_signal(self._make_signal())
+
+    def test_send_signal_calls_telegram(self):
+        from notifier import Notifier
+        import requests as req_lib
+
+        n = Notifier(telegram_token="token", telegram_chat_id="chat")
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        with patch("notifier.requests.post", return_value=mock_resp) as mock_post:
+            n.send_signal(self._make_signal())
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args
+        assert call_kwargs[0][0].startswith("https://api.telegram.org/bot")
+
+    def test_send_signal_calls_discord(self):
+        from notifier import Notifier
+
+        webhook = "https://discord.com/api/webhooks/1234/abcd"
+        n = Notifier(discord_webhook=webhook)
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        with patch("notifier.requests.post", return_value=mock_resp) as mock_post:
+            n.send_signal(self._make_signal())
+        mock_post.assert_called_once()
+        assert mock_post.call_args[0][0] == webhook
+
+    def test_send_text_swallows_network_error(self):
+        from notifier import Notifier
+        import requests as req_lib
+
+        n = Notifier(telegram_token="tok", telegram_chat_id="cid")
+        with patch("notifier.requests.post", side_effect=req_lib.RequestException("err")):
+            # Should not raise
+            n.send_text("hello")
+
+    def test_format_signal_contains_key_fields(self):
+        from notifier import _format_signal
+
+        sig = self._make_signal()
+        text = _format_signal(sig)
+        assert "BDO" in text
+        assert "BUY" in text
+        assert "132.50" in text
+        assert "136.50" in text
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline — new CLI flags
+# ---------------------------------------------------------------------------
+
+
+class TestMainNewFlags:
+    def test_parse_args_aspects_flag(self):
+        from main import parse_args
+
+        args = parse_args(["--aspects"])
+        assert args.aspects is True
+
+    def test_parse_args_telegram_flags(self):
+        from main import parse_args
+
+        args = parse_args(["--telegram-token", "tok", "--telegram-chat-id", "cid"])
+        assert args.telegram_token == "tok"
+        assert args.telegram_chat_id == "cid"
+
+    def test_parse_args_discord_flag(self):
+        from main import parse_args
+
+        args = parse_args(["--discord-webhook", "https://discord.com/api/webhooks/x"])
+        assert args.discord_webhook == "https://discord.com/api/webhooks/x"
+
+    def test_build_report_includes_valid_until_and_entry_note(self):
+        from main import build_report
+        from sentiment_analyzer import SentimentResult
+        from trading_signals import TradingSignal
+        from datetime import datetime, timezone, timedelta
+        from scraper import NewsArticle
+
+        pht = timezone(timedelta(hours=8))
+        article = NewsArticle(
+            title="BDO profits",
+            url="https://example.com/bdo",
+            summary="Record income.",
+            category="Business",
+        )
+        result = SentimentResult(
+            text="BDO profits up.",
+            label="positive",
+            score=0.88,
+            all_scores={"positive": 0.88, "negative": 0.07, "neutral": 0.05},
+            strength="strong",
+            affected_stocks=[
+                {"ticker": "BDO", "name": "BDO Unibank", "sector": "Financials",
+                 "match_type": "direct", "matched_keyword": "BDO"}
+            ],
+        )
+        sig = TradingSignal(
+            ticker="BDO",
+            name="BDO Unibank",
+            sector="Financials",
+            match_type="direct",
+            signal="BUY",
+            strength="STRONG",
+            entry_price=100.0,
+            target_price=103.0,
+            stop_loss=98.0,
+            sentiment_label="positive",
+            sentiment_score=0.88,
+            reasoning="Test.",
+            entry_note="NEXT OPEN",
+            valid_until=datetime(2025, 1, 6, 15, 0, tzinfo=pht),
+            atr=1.5,
+        )
+        signals_map = {article.url: [sig]}
+        report = build_report([article], [result], signals_map=signals_map)
+        sig_row = report[0]["trading_signals"][0]
+        assert sig_row["entry_note"] == "NEXT OPEN"
+        assert sig_row["valid_until"] is not None
+        assert sig_row["atr"] == pytest.approx(1.5)

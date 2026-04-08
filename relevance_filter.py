@@ -112,6 +112,12 @@ FINANCIAL_CATEGORIES: frozenset[str] = frozenset(
 # Score must reach this threshold for an article to be considered financial
 RELEVANCE_THRESHOLD: float = 3.0
 
+# Minimum number of *distinct* financial keywords that must appear in the text.
+# A single brand mention (e.g. "San Miguel") can push the score above the
+# threshold via PSE-stock keywords, but without at least this many genuine
+# financial-context words the article is treated as non-financial.
+MIN_FINANCIAL_KEYWORD_COUNT: int = 2
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -150,9 +156,11 @@ class RelevanceFilter:
     def __init__(
         self,
         threshold: float = RELEVANCE_THRESHOLD,
+        min_keyword_count: int = MIN_FINANCIAL_KEYWORD_COUNT,
         db=None,
     ):
         self.threshold = threshold
+        self.min_keyword_count = min_keyword_count
         self._db = db
         self._cache: dict[str, RelevanceResult] = {}
 
@@ -207,10 +215,13 @@ class RelevanceFilter:
     def _evaluate(self, article: "NewsArticle") -> RelevanceResult:
         score = 0.0
         reasons: list[str] = []
+        keyword_hits: int = 0
+        has_financial_category = False
 
         # Category boost
         if article.category and article.category.lower() in FINANCIAL_CATEGORIES:
             score += 5.0
+            has_financial_category = True
             reasons.append(f"category={article.category!r}")
 
         # Keyword scoring over title + summary + content prefix
@@ -222,10 +233,18 @@ class RelevanceFilter:
         for keyword, weight in FINANCIAL_KEYWORDS:
             if keyword.lower() in combined_lower:
                 score += weight
+                keyword_hits += 1
                 reasons.append(f"keyword={keyword!r}")
 
+        # The minimum-keyword-count gate guards against lifestyle / entertainment
+        # articles that mention a brand (e.g. "celebrity drinks San Miguel") but
+        # contain no genuine financial vocabulary.  When the article's *category*
+        # is already classified as financial we trust that classification and skip
+        # the count gate — it only applies to keyword-only passes.
+        passes_keyword_count = has_financial_category or keyword_hits >= self.min_keyword_count
+
         return RelevanceResult(
-            is_financial=score >= self.threshold,
+            is_financial=score >= self.threshold and passes_keyword_count,
             score=score,
             reasons=reasons,
         )
