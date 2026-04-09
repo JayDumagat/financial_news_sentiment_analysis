@@ -888,9 +888,12 @@ class TestDataLake:
         pre_path = lake.save_preprocessed_article(art)
         clean_path = lake.save_cleaned_article(art)
         analyzed_path = lake.save_analyzed_result(art, result)
-        # Each path is <base>/<tier>/<YYYY>/<MM>/<DD>/<file> — extract tier name
+        # Each path is <base>/<tier>/YYYY/MM/DD/<file> — extract tier name
+        # by finding the component that directly follows the lake base path.
+        lake_root = tmp_path / "lake"
         def _tier(p):
-            return p.parts[-5]  # 5 levels up: tier/YYYY/MM/DD/file → tier
+            rel = p.relative_to(lake_root)
+            return rel.parts[0]
         tiers = {_tier(raw_path), _tier(html_path), _tier(pre_path),
                  _tier(clean_path), _tier(analyzed_path)}
         assert tiers == {"raw", "raw_html", "preprocessed", "cleaned", "analyzed"}

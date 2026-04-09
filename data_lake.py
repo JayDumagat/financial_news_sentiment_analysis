@@ -279,6 +279,8 @@ class DataLake:
 
     def _dest_path(self, tier: str, url: str, source: str, ext: str = "json") -> Path:
         """Build the destination file path for *tier*."""
+        if ext not in {"json", "html"}:
+            raise ValueError(f"Unsupported data lake file extension: {ext!r}")
         date_str = datetime.now(timezone.utc).strftime(_DATE_FMT)
         filename = f"{source}_{_url_hash(url)}.{ext}"
         return self.base_path / tier / date_str / filename

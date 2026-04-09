@@ -223,7 +223,7 @@ class ANCNewsScraper:
 
         if html and self.data_lake is not None:
             try:
-                self.data_lake.save_raw_html(url, html)
+                self.data_lake.save_raw_html(url, html, source="anc")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Data lake raw HTML save failed for %s: %s", url, exc)
 
