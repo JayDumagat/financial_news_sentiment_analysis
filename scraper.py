@@ -4,6 +4,17 @@ ABS-CBN ANC Financial News Scraper
 Scrapes financial/business news articles from the ABS-CBN ANC website
 (https://www.abs-cbn.com/anc/anc).
 
+The ABS-CBN ANC website is a JavaScript-rendered (dynamic) single-page
+application.  Plain ``requests`` cannot retrieve rendered article cards
+because the content is injected by JavaScript after the initial HTML load.
+This scraper uses a **headless Chromium browser** (via Playwright) to fully
+render each page before parsing the resulting DOM with BeautifulSoup.
+
+To install the required Chromium binary after ``pip install playwright``,
+run once::
+
+    playwright install chromium
+
 Watch / daemon mode
 -------------------
 :func:`run_forever` polls the news listing on a configurable interval,
@@ -14,6 +25,7 @@ observed between HTTP requests, and a configurable inter-poll interval
 prevents hammering the target server.
 """
 
+import re
 import signal
 import time
 import logging
@@ -21,7 +33,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
-import requests
 from bs4 import BeautifulSoup
 
 if TYPE_CHECKING:
@@ -42,6 +53,9 @@ _FALLBACK_UA = (
 
 REQUEST_DELAY = 1.5  # seconds between requests to be polite
 
+# Regex for ABS-CBN article URL paths (e.g. /anc/business/article/2024/1/15/...)
+_ARTICLE_URL_RE = re.compile(r"/(?:anc|news)/[\w/-]*article/\d{4}/")
+
 
 def _get_random_ua() -> str:
     """Return a random browser User-Agent string.
@@ -57,13 +71,6 @@ def _get_random_ua() -> str:
         return UserAgent().random
     except Exception:  # library absent or network error during UA update
         return _FALLBACK_UA
-
-
-def _build_headers() -> dict:
-    return {
-        "User-Agent": _get_random_ua(),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
 
 
 @dataclass
@@ -88,25 +95,17 @@ class NewsArticle:
         return self.title
 
 
-def _class_contains(keyword: str):
-    """Return a BeautifulSoup class-filter callable that checks for *keyword*."""
-
-    def _filter(css_classes):
-        if not css_classes:
-            return False
-        classes = css_classes if isinstance(css_classes, list) else [css_classes]
-        return any(keyword in c.lower() for c in classes)
-
-    return _filter
-
 
 class ANCNewsScraper:
-    """Scraper for ABS-CBN ANC financial news articles."""
+    """Scraper for ABS-CBN ANC financial news articles.
+
+    Uses a headless Chromium browser (Playwright) to render the JavaScript-
+    driven ABS-CBN ANC pages before extracting article data.  Run
+    ``playwright install chromium`` once after installing the package.
+    """
 
     def __init__(self, delay: float = REQUEST_DELAY):
         self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update(_build_headers())
 
     # ------------------------------------------------------------------
     # Public API
@@ -148,17 +147,61 @@ class ANCNewsScraper:
         """
         try:
             time.sleep(self.delay)
-            response = self.session.get(article.url, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
+            html = self._fetch_html(article.url)
+            if html is None:
+                return article
+            soup = BeautifulSoup(html, "html.parser")
             article.content = self._extract_body(soup)
-        except requests.RequestException as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch %s: %s", article.url, exc)
         return article
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _fetch_html(self, url: str) -> Optional[str]:
+        """Return the fully-rendered HTML for *url* using a headless browser.
+
+        Uses Playwright's Chromium in headless mode so that JavaScript-driven
+        content is executed before the DOM is captured.  Returns ``None`` on
+        any failure (network error, Playwright not installed, timeout, …).
+
+        This method is intentionally thin so that tests can patch it easily::
+
+            with patch("scraper.ANCNewsScraper._fetch_html", return_value=html):
+                articles = scraper.get_articles()
+        """
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore[import]
+
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                try:
+                    ctx = browser.new_context(
+                        user_agent=_get_random_ua(),
+                        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                    )
+                    page = ctx.new_page()
+                    page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                    # Wait for JS to populate the article list; fall through on
+                    # timeout rather than raising so we still get whatever is there.
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return page.content()
+                finally:
+                    browser.close()
+        except ImportError:
+            logger.error(
+                "Playwright is not installed.  "
+                "Run: pip install playwright && playwright install chromium"
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Playwright fetch failed for %s: %s", url, exc)
+            return None
 
     def _scrape_listing(
         self,
@@ -170,15 +213,13 @@ class ANCNewsScraper:
         exclude_urls = exclude_urls or set()
         articles: list[NewsArticle] = []
 
-        try:
-            time.sleep(self.delay)
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            logger.error("Failed to fetch listing page %s: %s", url, exc)
+        time.sleep(self.delay)
+        html = self._fetch_html(url)
+        if html is None:
+            logger.error("Failed to fetch listing page %s", url)
             return articles
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         cards = self._find_article_cards(soup)
 
         for card in cards:
@@ -191,25 +232,56 @@ class ANCNewsScraper:
         return articles
 
     def _find_article_cards(self, soup: BeautifulSoup) -> list:
-        """
-        Return a list of tag elements that look like article cards.
+        """Return a list of tag elements that look like article cards.
 
-        The ABS-CBN website uses several layouts; we try the most common
-        selectors in order.
+        Tries several strategies in order so the scraper degrades gracefully
+        if ABS-CBN's CSS class names change:
+
+        1. Standard ``<article>`` semantic elements.
+        2. Elements whose class name contains common card keywords.
+        3. URL-pattern matching — find ``<a>`` tags whose ``href`` looks like
+           an article path and return their nearest meaningful parent container.
         """
-        selectors = [
-            "article.article-card",
-            "div.article-card",
-            "div.story-card",
-            "li.article-item",
-            "div.news-item",
-            # generic fallback: any <a> inside <article>
-            "article",
+        # Strategy 1: semantic <article> tags (most reliable)
+        cards = soup.find_all("article")
+        if cards:
+            return cards
+
+        # Strategy 2: elements whose CSS class contains a card keyword
+        card_keywords = [
+            "article-card", "story-card", "news-card",
+            "article-item", "news-item", "content-card",
+            "card--article", "post-card",
         ]
-        for selector in selectors:
-            cards = soup.select(selector)
+        for keyword in card_keywords:
+            cards = soup.find_all(
+                lambda tag, kw=keyword: (  # noqa: E731
+                    tag.has_attr("class")
+                    and any(kw in c.lower() for c in tag["class"])
+                )
+            )
             if cards:
                 return cards
+
+        # Strategy 3: links matching ABS-CBN article URL patterns
+        links = soup.find_all("a", href=_ARTICLE_URL_RE)
+        if links:
+            seen_ids: set[int] = set()
+            containers = []
+            for link in links:
+                # Walk up to find a meaningful container element
+                node = link.parent
+                for _ in range(4):
+                    if node is None or node.name in ("body", "html", "[document]"):
+                        break
+                    if id(node) not in seen_ids:
+                        seen_ids.add(id(node))
+                        containers.append(node)
+                        break
+                    node = node.parent
+            if containers:
+                return containers
+
         return []
 
     def _parse_card(self, card) -> Optional[NewsArticle]:
@@ -223,23 +295,47 @@ class ANCNewsScraper:
         if not href.startswith("http"):
             href = "https://www.abs-cbn.com" + href
 
-        title_tag = card.find(["h1", "h2", "h3", "h4", "span"], class_=_class_contains("title"))
+        # Look for a dedicated title element (heading or labelled span/div)
+        title_tag = (
+            card.find(["h1", "h2", "h3", "h4"], attrs={"class": True})
+            or card.find(["h1", "h2", "h3", "h4"])
+            or card.find(
+                ["span", "div", "p"],
+                class_=lambda c: c and any(
+                    kw in " ".join(c).lower()
+                    for kw in ("title", "headline", "heading", "story-name")
+                ),
+            )
+        )
         title = title_tag.get_text(strip=True) if title_tag else link.get_text(strip=True)
 
         if not title:
             return None
 
         # --- Summary / Teaser ---
-        summary_tag = card.find("p")
+        summary_tag = card.find(
+            ["p", "div", "span"],
+            class_=lambda c: c and any(
+                kw in " ".join(c).lower()
+                for kw in ("summary", "description", "teaser", "excerpt", "blurb")
+            ),
+        ) or card.find("p")
         summary = summary_tag.get_text(strip=True) if summary_tag else ""
 
         # --- Category ---
-        cat_tag = card.find(class_=_class_contains("category"))
+        cat_tag = card.find(
+            class_=lambda c: c and any(
+                kw in " ".join(c).lower()
+                for kw in ("category", "section", "tag", "label")
+            )
+        )
         category = cat_tag.get_text(strip=True) if cat_tag else ""
 
         # --- Published date ---
         time_tag = card.find("time")
-        published_at = time_tag.get("datetime") if time_tag else None
+        published_at = None
+        if time_tag:
+            published_at = time_tag.get("datetime") or time_tag.get_text(strip=True) or None
 
         return NewsArticle(
             title=title,
@@ -251,20 +347,25 @@ class ANCNewsScraper:
 
     def _extract_body(self, soup: BeautifulSoup) -> str:
         """Extract the main body text from an article page."""
-        # Try common article body selectors used by ABS-CBN
+        # Ordered list of CSS selectors to try for the article body.
+        # ABS-CBN and common news CMS class patterns are included.
         body_selectors = [
-            "div.article-body",
-            "div.story-body",
-            "div.entry-content",
-            "div[class*='article-content']",
-            "div[class*='story-content']",
+            "[class*='article-body']",
+            "[class*='story-body']",
+            "[class*='article-content']",
+            "[class*='story-content']",
+            "[class*='entry-content']",
+            "[class*='post-content']",
+            "[class*='news-content']",
+            "div.content",
+            "main article",
             "article",
         ]
         for selector in body_selectors:
             body = soup.select_one(selector)
             if body:
-                # Remove script/style noise
-                for tag in body.find_all(["script", "style", "figure", "aside"]):
+                # Remove script/style/ad noise
+                for tag in body.find_all(["script", "style", "figure", "aside", "nav"]):
                     tag.decompose()
                 paragraphs = body.find_all("p")
                 if paragraphs:

@@ -66,24 +66,24 @@ class TestANCNewsScraper:
 
         self.scraper = ANCNewsScraper(delay=0)
 
-    @patch("scraper.requests.Session.get")
-    def test_get_articles_parses_cards(self, mock_get):
-        mock_get.return_value = _make_response(SAMPLE_HTML_LISTING)
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_get_articles_parses_cards(self, mock_fetch):
+        mock_fetch.return_value = SAMPLE_HTML_LISTING
         articles = self.scraper.get_articles(max_articles=5)
         assert len(articles) >= 1
         titles = [a.title for a in articles]
         assert any("Test Headline" in t or "Second Article" in t for t in titles)
 
-    @patch("scraper.requests.Session.get")
-    def test_get_articles_url_normalization(self, mock_get):
-        mock_get.return_value = _make_response(SAMPLE_HTML_LISTING)
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_get_articles_url_normalization(self, mock_fetch):
+        mock_fetch.return_value = SAMPLE_HTML_LISTING
         articles = self.scraper.get_articles(max_articles=5)
         for art in articles:
             assert art.url.startswith("http"), f"URL should be absolute: {art.url}"
 
-    @patch("scraper.requests.Session.get")
-    def test_enrich_article_fills_content(self, mock_get):
-        mock_get.return_value = _make_response(SAMPLE_HTML_ARTICLE)
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_enrich_article_fills_content(self, mock_fetch):
+        mock_fetch.return_value = SAMPLE_HTML_ARTICLE
         from scraper import NewsArticle
 
         article = NewsArticle(
@@ -93,17 +93,15 @@ class TestANCNewsScraper:
         self.scraper.enrich_article(article)
         assert "Paragraph one" in article.content or article.content == ""
 
-    @patch("scraper.requests.Session.get")
-    def test_get_articles_max_limit(self, mock_get):
-        mock_get.return_value = _make_response(SAMPLE_HTML_LISTING)
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_get_articles_max_limit(self, mock_fetch):
+        mock_fetch.return_value = SAMPLE_HTML_LISTING
         articles = self.scraper.get_articles(max_articles=1)
         assert len(articles) <= 1
 
-    @patch("scraper.requests.Session.get")
-    def test_http_error_returns_empty(self, mock_get):
-        import requests as req_lib
-
-        mock_get.side_effect = req_lib.RequestException("network error")
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_fetch_error_returns_empty(self, mock_fetch):
+        mock_fetch.return_value = None  # simulate Playwright / network failure
         articles = self.scraper.get_articles(max_articles=5)
         assert articles == []
 
@@ -952,19 +950,18 @@ class TestTradingSignals:
 
 class TestBacktester:
     def _make_price_dataframe(self, n=300, start_price=100.0, trend=0.0001):
-        """Build a simple synthetic price DataFrame that mimics yfinance output."""
+        """Build a simple synthetic price DataFrame that mimics tvdatafeed output."""
         import pandas as pd
 
         dates = pd.date_range("2023-01-01", periods=n, freq="B")
         prices = [start_price * (1 + trend) ** i for i in range(n)]
-        df = pd.DataFrame({"Close": prices}, index=dates)
+        df = pd.DataFrame({"close": prices}, index=dates)
         return df
 
     def test_backtest_returns_result_object(self):
         from backtester import backtest_signal, BacktestResult
 
-        with patch("backtester.yf") as mock_yf:
-            mock_yf.download.return_value = self._make_price_dataframe()
+        with patch("backtester._download_ohlcv", return_value=self._make_price_dataframe()):
             result = backtest_signal("BDO", "BUY", holding_days=5, lookback_days=252)
         assert isinstance(result, BacktestResult)
         assert result.ticker == "BDO"
@@ -973,8 +970,7 @@ class TestBacktester:
     def test_backtest_win_rate_in_range(self):
         from backtester import backtest_signal
 
-        with patch("backtester.yf") as mock_yf:
-            mock_yf.download.return_value = self._make_price_dataframe(trend=0.001)
+        with patch("backtester._download_ohlcv", return_value=self._make_price_dataframe(trend=0.001)):
             result = backtest_signal("JFC", "BUY", holding_days=5)
         assert result.win_rate is not None
         assert 0.0 <= result.win_rate <= 1.0
@@ -982,8 +978,7 @@ class TestBacktester:
     def test_backtest_sell_win_rate_falling_market(self):
         from backtester import backtest_signal
 
-        with patch("backtester.yf") as mock_yf:
-            mock_yf.download.return_value = self._make_price_dataframe(trend=-0.001)
+        with patch("backtester._download_ohlcv", return_value=self._make_price_dataframe(trend=-0.001)):
             result = backtest_signal("MER", "SELL", holding_days=5)
         assert result.win_rate is not None
         # In a consistently falling market, SELL should win most of the time
@@ -993,25 +988,23 @@ class TestBacktester:
         from backtester import backtest_signal
         import pandas as pd
 
-        with patch("backtester.yf") as mock_yf:
-            mock_yf.download.return_value = pd.DataFrame()
-            result = backtest_signal("FAKE", "BUY")
+        with patch("backtester._download_ohlcv", return_value=pd.DataFrame()):
+            with patch("backtester._fetch_tv_current_metrics", return_value=(None, None)):
+                result = backtest_signal("FAKE", "BUY")
         assert result.win_rate is None
         assert result.current_trend is None
 
     def test_backtest_trend_uptrend(self):
         from backtester import backtest_signal
 
-        with patch("backtester.yf") as mock_yf:
-            mock_yf.download.return_value = self._make_price_dataframe(trend=0.002)
+        with patch("backtester._download_ohlcv", return_value=self._make_price_dataframe(trend=0.002)):
             result = backtest_signal("BDO", "BUY")
         assert result.current_trend == "UPTREND"
 
     def test_backtest_trend_downtrend(self):
         from backtester import backtest_signal
 
-        with patch("backtester.yf") as mock_yf:
-            mock_yf.download.return_value = self._make_price_dataframe(trend=-0.002)
+        with patch("backtester._download_ohlcv", return_value=self._make_price_dataframe(trend=-0.002)):
             result = backtest_signal("BDO", "SELL")
         assert result.current_trend == "DOWNTREND"
 
@@ -1038,17 +1031,16 @@ class TestBacktester:
     def test_backtest_multiple_signals(self):
         from backtester import backtest_signals
 
-        with patch("backtester.yf") as mock_yf:
-            mock_yf.download.return_value = self._make_price_dataframe()
+        with patch("backtester._download_ohlcv", return_value=self._make_price_dataframe()):
             results = backtest_signals([("BDO", "BUY"), ("JFC", "SELL")])
         assert len(results) == 2
 
-    def test_backtest_handles_yfinance_not_installed(self):
-        import backtester
+    def test_backtest_handles_tvdatafeed_not_installed(self):
         from backtester import backtest_signal
 
-        with patch.object(backtester, "yf", None):
-            result = backtest_signal("BDO", "BUY")
+        with patch("backtester._download_ohlcv", return_value=None):
+            with patch("backtester._fetch_tv_current_metrics", return_value=(None, None)):
+                result = backtest_signal("BDO", "BUY")
         assert result.win_rate is None
 
 
@@ -1546,11 +1538,14 @@ class TestFakeUserAgent:
         # to the static string — just check it's a non-empty string.
         assert len(ua) > 0
 
-    def test_scraper_session_has_user_agent(self):
-        from scraper import ANCNewsScraper
+    def test_scraper_uses_random_ua_in_fetch(self):
+        """Scraper passes a User-Agent via _get_random_ua() into _fetch_html."""
+        from scraper import ANCNewsScraper, _get_random_ua
 
         scraper = ANCNewsScraper(delay=0)
-        assert "User-Agent" in scraper.session.headers
+        # Verify _get_random_ua returns a valid UA string (consumed by _fetch_html)
+        ua = _get_random_ua()
+        assert isinstance(ua, str) and len(ua) > 10
 
 
 # ---------------------------------------------------------------------------

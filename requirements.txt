@@ -1,5 +1,5 @@
-# Core scraping dependencies
-requests>=2.31.0
+# Core scraping dependencies — headless browser for JS-rendered pages
+playwright>=1.40.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 
@@ -10,8 +10,12 @@ fake-useragent>=1.5.0
 transformers>=4.36.0
 torch>=2.1.0
 
-# Market data (trading signals & backtesting)
-yfinance>=0.2.0
+# Market data via TradingView (unofficial libraries — no official SDK exists)
+# tradingview-ta: current price, ATR, and TA indicators for PSE stocks
+tradingview-ta>=3.3.0
+# tvdatafeed: historical OHLCV for backtesting (optional; install separately)
+#   pip install tvdatafeed
+# Without it, win_rate / avg_return metrics will be None.
 
 # Testing
 pytest>=7.4.0
