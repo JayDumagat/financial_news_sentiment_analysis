@@ -56,6 +56,9 @@ REQUEST_DELAY = 1.5  # seconds between requests to be polite
 # Regex for ABS-CBN article URL paths (e.g. /anc/business/article/2024/1/15/...)
 _ARTICLE_URL_RE = re.compile(r"/(?:anc|news)/[\w/-]*article/\d{4}/")
 
+# Maximum number of parent elements to traverse when grouping article links
+_MAX_PARENT_WALK_DEPTH = 4
+
 
 def _get_random_ua() -> str:
     """Return a random browser User-Agent string.
@@ -94,6 +97,12 @@ class NewsArticle:
             return self.summary
         return self.title
 
+
+
+def _has_card_class(tag, keyword: str) -> bool:
+    """Return True when *tag* has a CSS class containing *keyword*."""
+    classes = tag.get("class") or []
+    return any(keyword in c.lower() for c in classes)
 
 
 class ANCNewsScraper:
@@ -255,10 +264,7 @@ class ANCNewsScraper:
         ]
         for keyword in card_keywords:
             cards = soup.find_all(
-                lambda tag, kw=keyword: (  # noqa: E731
-                    tag.has_attr("class")
-                    and any(kw in c.lower() for c in tag["class"])
-                )
+                lambda tag, kw=keyword: _has_card_class(tag, kw)
             )
             if cards:
                 return cards
@@ -271,7 +277,7 @@ class ANCNewsScraper:
             for link in links:
                 # Walk up to find a meaningful container element
                 node = link.parent
-                for _ in range(4):
+                for _ in range(_MAX_PARENT_WALK_DEPTH):
                     if node is None or node.name in ("body", "html", "[document]"):
                         break
                     if id(node) not in seen_ids:

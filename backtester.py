@@ -225,6 +225,10 @@ def backtest_signal(
             logger.debug("Insufficient price data for %s", ticker)
             return empty
 
+        if "close" not in data.columns:
+            logger.debug("Price data for %s missing 'close' column", ticker)
+            return empty
+
         close = data["close"].squeeze()  # ensure 1-D Series
 
         # ------------------------------------------------------------------
