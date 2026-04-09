@@ -16,9 +16,11 @@ For each stock identified as potentially affected by a news item, a
   entry should be taken at the **next market open** and uses the open
   price rather than the close.
 
-Price data is fetched from Yahoo Finance (PSE tickers use the ``.PS`` suffix).
-All price-fetch errors are silently swallowed so that signals are still
-generated (without prices) even when the network is unavailable.
+Price data is fetched from **TradingView** (via the unofficial
+``tradingview-ta`` library) using the PSE exchange and the ``philippines``
+screener.  Because this is an unofficial API, prices are silently swallowed
+on any error so signals are still generated (without prices) when the
+network is unavailable.
 
 Signal / price calculation rules
 ---------------------------------
@@ -159,10 +161,7 @@ _FALLBACK_RISK_PCT: dict[str, float] = {
 # Reward/risk ratio used to derive the take-profit target
 _REWARD_RISK_RATIO: float = 1.5
 
-# Yahoo Finance suffix for PSE-listed stocks
-_YF_SUFFIX = ".PS"
-
-# Number of periods for ATR calculation
+# Number of periods for ATR calculation (matches TradingView's default ATR(14))
 _ATR_PERIOD: int = 14
 
 # Signal validity windows by strength (hours after publication)
@@ -233,70 +232,56 @@ class TradingSignal:
 
 
 def _fetch_latest_price(ticker: str) -> Optional[float]:
-    """Return the latest closing price for *ticker* from Yahoo Finance.
+    """Return the latest closing price for *ticker* from TradingView.
 
-    Appends the ``.PS`` suffix automatically for PSE stocks and returns
-    ``None`` if the price cannot be retrieved for any reason.
+    Uses the unofficial ``tradingview-ta`` library with the PSE exchange and
+    ``philippines`` screener.  Returns ``None`` if the price cannot be
+    retrieved for any reason (library not installed, network error, etc.).
     """
     try:
-        import yfinance as yf  # imported here to keep module importable without yfinance
+        from tradingview_ta import TA_Handler, Interval  # type: ignore[import]
 
-        yf_ticker = ticker + _YF_SUFFIX
-        data = yf.download(yf_ticker, period="10d", progress=False, auto_adjust=True)
-        if data is None or data.empty:
-            logger.debug("No price data returned for %s", yf_ticker)
+        handler = TA_Handler(
+            symbol=ticker,
+            screener="philippines",
+            exchange="PSE",
+            interval=Interval.INTERVAL_1_DAY,
+        )
+        analysis = handler.get_analysis()
+        close = analysis.indicators.get("close")
+        if close is None:
             return None
-        close_series = data["Close"]
-        if hasattr(close_series, "iloc"):
-            latest = float(close_series.iloc[-1])
-        else:
-            latest = float(close_series)
-        return latest if latest > 0 else None
+        close = float(close)
+        return close if close > 0 else None
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Price fetch failed for %s: %s", ticker, exc)
+        logger.debug("TradingView price fetch failed for %s: %s", ticker, exc)
         return None
 
 
 def _fetch_atr(ticker: str, period: int = _ATR_PERIOD) -> Optional[float]:
-    """Compute the Average True Range for *ticker* over *period* days.
+    """Return the ATR({period}) value for *ticker* from TradingView.
 
-    Downloads the last ``period + 30`` calendar days of OHLC data and
-    returns the most recent ATR value, or ``None`` on any failure.
+    Uses the same ``tradingview-ta`` TA_Handler call as :func:`_fetch_latest_price`
+    — TradingView computes ATR(14) as a standard indicator so no separate OHLCV
+    download is required.  Returns ``None`` on any failure.
     """
     try:
-        import yfinance as yf
+        from tradingview_ta import TA_Handler, Interval  # type: ignore[import]
 
-        yf_ticker = ticker + _YF_SUFFIX
-        data = yf.download(
-            yf_ticker,
-            period=f"{period + 30}d",
-            progress=False,
-            auto_adjust=True,
+        handler = TA_Handler(
+            symbol=ticker,
+            screener="philippines",
+            exchange="PSE",
+            interval=Interval.INTERVAL_1_DAY,
         )
-        if data is None or data.empty or len(data) < period + 1:
+        analysis = handler.get_analysis()
+        atr = analysis.indicators.get("ATR")
+        if atr is None:
             return None
-
-        high = data["High"].squeeze()
-        low = data["Low"].squeeze()
-        close = data["Close"].squeeze()
-
-        # True Range = max(H-L, |H-prev_C|, |L-prev_C|)
-        import pandas as pd  # noqa: PLC0415
-
-        prev_close = close.shift(1)
-        tr = pd.concat(
-            [
-                high - low,
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-
-        atr = float(tr.iloc[-period:].mean())
+        atr = float(atr)
         return atr if atr > 0 else None
     except Exception as exc:  # noqa: BLE001
-        logger.debug("ATR fetch failed for %s: %s", ticker, exc)
+        logger.debug("TradingView ATR fetch failed for %s: %s", ticker, exc)
         return None
 
 

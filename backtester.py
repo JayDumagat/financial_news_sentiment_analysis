@@ -5,7 +5,8 @@ Evaluates how accurate a BUY or SELL signal for a given PSE-listed stock
 would have been if applied historically.  Because we do not store past news
 articles, the backtest takes a **price-only** approach:
 
-* Download up to ``lookback_days`` of daily close prices from Yahoo Finance.
+* Download up to ``lookback_days`` of daily close prices from TradingView
+  (via the unofficial ``tvdatafeed`` library when installed).
 * Simulate entering the trade on *every* trading day in that window and
   holding for ``holding_days``.
 * Report the fraction of those entries that moved in the signal direction
@@ -19,14 +20,25 @@ predictive value.
 Additional metrics returned
 ---------------------------
 * ``current_trend``  — ``"UPTREND"`` / ``"DOWNTREND"`` / ``"SIDEWAYS"`` based
-  on the 20-day simple moving average.
+  on the 20-day simple moving average.  Derived from TradingView TA data when
+  historical bars are unavailable.
 * ``price_vs_ma20``  — percentage distance of the latest close from the 20-day
   MA (positive = above, negative = below).
-* ``recent_return_5d``  — 5-day price change as a percentage.
-* ``recent_return_20d`` — 20-day price change as a percentage.
+* ``recent_return_5d``  — 5-day price change as a percentage (requires
+  historical data from ``tvdatafeed``).
+* ``recent_return_20d`` — 20-day price change as a percentage (requires
+  historical data from ``tvdatafeed``).
 
 All network / data errors are silently swallowed so callers always receive
 a result (possibly with ``None`` fields when data is unavailable).
+
+Data sources
+------------
+* **Historical OHLCV** — ``tvdatafeed`` (unofficial TradingView library).
+  Install with ``pip install tvdatafeed``.  If not installed, win-rate and
+  return metrics will be ``None``.
+* **Current TA metrics** — ``tradingview-ta`` (unofficial).  Used as a
+  fallback to populate trend / MA metrics when historical data is absent.
 """
 
 from __future__ import annotations
@@ -37,17 +49,70 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Lazy module-level reference so tests can patch it as `backtester.yf`
-try:
-    import yfinance as yf
-except ImportError:  # pragma: no cover
-    yf = None  # type: ignore[assignment]
-
-# Yahoo Finance PSE suffix
-_YF_SUFFIX = ".PS"
-
 # Tolerance band for "SIDEWAYS" classification (MA distance within ±1 %)
 _SIDEWAYS_BAND: float = 0.01
+
+
+def _download_ohlcv(ticker: str, n_bars: int):
+    """Download daily OHLCV history for a PSE stock from TradingView.
+
+    Uses the unofficial ``tvdatafeed`` library.  Returns a
+    :class:`pandas.DataFrame` with lowercase columns (``open``, ``high``,
+    ``low``, ``close``, ``volume``) or ``None`` when the library is not
+    installed or the fetch fails for any reason.
+
+    This function is kept deliberately thin so that tests can patch it::
+
+        with patch("backtester._download_ohlcv", return_value=df):
+            result = backtest_signal("BDO", "BUY")
+    """
+    try:
+        from tvdatafeed import TvDatafeed, Interval  # type: ignore[import]
+
+        tv = TvDatafeed()
+        data = tv.get_hist(
+            symbol=ticker,
+            exchange="PSE",
+            interval=Interval.in_daily,
+            n_bars=n_bars,
+        )
+        return data
+    except ImportError:
+        logger.warning(
+            "tvdatafeed is not installed; historical backtesting is unavailable.  "
+            "Install with: pip install tvdatafeed"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("TradingView OHLCV fetch failed for %s: %s", ticker, exc)
+        return None
+
+
+def _fetch_tv_current_metrics(ticker: str):
+    """Return (close_price, sma20) from TradingView TA for *ticker*.
+
+    Uses the unofficial ``tradingview-ta`` library.  Both values are ``None``
+    when the library is absent or the fetch fails.
+    """
+    try:
+        from tradingview_ta import TA_Handler, Interval  # type: ignore[import]
+
+        handler = TA_Handler(
+            symbol=ticker,
+            screener="philippines",
+            exchange="PSE",
+            interval=Interval.INTERVAL_1_DAY,
+        )
+        analysis = handler.get_analysis()
+        close = analysis.indicators.get("close")
+        sma20 = analysis.indicators.get("SMA20")
+        return (
+            float(close) if close is not None else None,
+            float(sma20) if sma20 is not None else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("TradingView current metrics fetch failed for %s: %s", ticker, exc)
+        return None, None
 
 
 @dataclass
@@ -107,8 +172,7 @@ def backtest_signal(
     """Run a price-only backtest for a PSE stock signal.
 
     Args:
-        ticker: PSE ticker symbol (e.g. ``"BDO"``).  The ``.PS`` suffix is
-                added automatically.
+        ticker: PSE ticker symbol (e.g. ``"BDO"``).
         signal: ``"BUY"`` or ``"SELL"``.
         holding_days: Number of trading days to hold the position.
         lookback_days: Number of calendar days of historical data to download.
@@ -131,19 +195,41 @@ def backtest_signal(
     )
 
     try:
-        if yf is None:
-            logger.warning("yfinance is not installed; backtesting is unavailable.")
-            return empty
+        n_bars = lookback_days + holding_days + 30
+        data = _download_ohlcv(ticker, n_bars)
 
-        yf_ticker = ticker + _YF_SUFFIX
-        # Download a bit more than needed so we have enough rows after windowing
-        period_str = f"{lookback_days + holding_days + 30}d"
-        data = yf.download(yf_ticker, period=period_str, progress=False, auto_adjust=True)
         if data is None or data.empty or len(data) < holding_days + 5:
-            logger.debug("Insufficient price data for %s", yf_ticker)
+            # Historical data unavailable — try to populate trend metrics from
+            # TradingView TA (current snapshot only).
+            close_price, sma20 = _fetch_tv_current_metrics(ticker)
+            if close_price is not None and sma20 is not None and sma20 > 0:
+                price_vs_ma20 = (close_price - sma20) / sma20
+                if abs(price_vs_ma20) <= _SIDEWAYS_BAND:
+                    current_trend = "SIDEWAYS"
+                elif price_vs_ma20 > 0:
+                    current_trend = "UPTREND"
+                else:
+                    current_trend = "DOWNTREND"
+                return BacktestResult(
+                    ticker=ticker,
+                    signal=signal,
+                    holding_days=holding_days,
+                    win_rate=None,
+                    avg_return=None,
+                    sample_size=None,
+                    current_trend=current_trend,
+                    price_vs_ma20=price_vs_ma20,
+                    recent_return_5d=None,
+                    recent_return_20d=None,
+                )
+            logger.debug("Insufficient price data for %s", ticker)
             return empty
 
-        close = data["Close"].squeeze()  # ensure 1-D Series
+        if "close" not in data.columns:
+            logger.debug("Price data for %s missing 'close' column", ticker)
+            return empty
+
+        close = data["close"].squeeze()  # ensure 1-D Series
 
         # ------------------------------------------------------------------
         # Forward-return simulation
