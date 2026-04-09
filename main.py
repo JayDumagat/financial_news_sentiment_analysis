@@ -461,6 +461,8 @@ def run(args: argparse.Namespace) -> list[dict]:
         for article in financial_articles:
             try:
                 lake.save_raw_article(article)
+                lake.save_preprocessed_article(article)
+                lake.save_cleaned_article(article)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Data lake write failed: %s", exc)
 
@@ -503,6 +505,7 @@ def run(args: argparse.Namespace) -> list[dict]:
         for article, result in zip(financial_articles, results):
             try:
                 lake.save_processed_result(article, result)
+                lake.save_analyzed_result(article, result)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Data lake processed write failed: %s", exc)
 
@@ -614,6 +617,7 @@ def _watch(args: argparse.Namespace) -> None:
         if lake is not None:
             try:
                 lake.save_processed_result(article, result)
+                lake.save_analyzed_result(article, result)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Data lake write failed: %s", exc)
 

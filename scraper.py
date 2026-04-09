@@ -87,6 +87,7 @@ class NewsArticle:
     published_at: Optional[str] = None
     category: str = ""
     tags: list = field(default_factory=list)
+    meta: dict = field(default_factory=dict)
 
     def get_text_for_analysis(self) -> str:
         """Return the best available text for sentiment analysis."""
@@ -113,8 +114,9 @@ class ANCNewsScraper:
     ``playwright install chromium`` once after installing the package.
     """
 
-    def __init__(self, delay: float = REQUEST_DELAY):
+    def __init__(self, delay: float = REQUEST_DELAY, data_lake=None):
         self.delay = delay
+        self.data_lake = data_lake
 
     # ------------------------------------------------------------------
     # Public API
@@ -146,13 +148,15 @@ class ANCNewsScraper:
 
     def enrich_article(self, article: NewsArticle) -> NewsArticle:
         """
-        Fetch and attach the full body text of *article* (in-place).
+        Fetch and attach the full body text and head metadata of *article*
+        (in-place).
 
         Args:
-            article: Article whose ``content`` field will be populated.
+            article: Article whose ``content`` and ``meta`` fields will be
+                     populated.
 
         Returns:
-            The same article instance, now with ``content`` filled.
+            The same article instance, now with ``content`` and ``meta`` filled.
         """
         try:
             time.sleep(self.delay)
@@ -161,6 +165,7 @@ class ANCNewsScraper:
                 return article
             soup = BeautifulSoup(html, "html.parser")
             article.content = self._extract_body(soup)
+            article.meta = self._extract_meta(soup)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch %s: %s", article.url, exc)
         return article
@@ -175,6 +180,10 @@ class ANCNewsScraper:
         Uses Playwright's Chromium in headless mode so that JavaScript-driven
         content is executed before the DOM is captured.  Returns ``None`` on
         any failure (network error, Playwright not installed, timeout, …).
+
+        When a :class:`~data_lake.DataLake` was provided at construction time
+        the raw HTML is saved via :meth:`~data_lake.DataLake.save_raw_html`
+        before being returned.
 
         This method is intentionally thin so that tests can patch it easily::
 
@@ -199,7 +208,7 @@ class ANCNewsScraper:
                         page.wait_for_load_state("networkidle", timeout=15_000)
                     except Exception:  # noqa: BLE001
                         pass
-                    return page.content()
+                    html = page.content()
                 finally:
                     browser.close()
         except ImportError:
@@ -211,6 +220,14 @@ class ANCNewsScraper:
         except Exception as exc:  # noqa: BLE001
             logger.error("Playwright fetch failed for %s: %s", url, exc)
             return None
+
+        if html and self.data_lake is not None:
+            try:
+                self.data_lake.save_raw_html(url, html)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Data lake raw HTML save failed for %s: %s", url, exc)
+
+        return html
 
     def _scrape_listing(
         self,
@@ -254,6 +271,7 @@ class ANCNewsScraper:
         # Strategy 1: semantic <article> tags (most reliable)
         cards = soup.find_all("article")
         if cards:
+            logger.info("Found %d article elements via <article> tags", len(cards))
             return cards
 
         # Strategy 2: elements whose CSS class contains a card keyword
@@ -267,11 +285,19 @@ class ANCNewsScraper:
                 lambda tag, kw=keyword: _has_card_class(tag, kw)
             )
             if cards:
+                logger.info(
+                    "Found %d article elements via CSS class keyword '%s'",
+                    len(cards), keyword,
+                )
                 return cards
 
         # Strategy 3: links matching ABS-CBN article URL patterns
         links = soup.find_all("a", href=_ARTICLE_URL_RE)
         if links:
+            logger.info(
+                "Found %d links matching article URL pattern — collecting containers",
+                len(links),
+            )
             seen_ids: set[int] = set()
             containers = []
             for link in links:
@@ -350,6 +376,28 @@ class ANCNewsScraper:
             category=category,
             published_at=published_at,
         )
+
+    @staticmethod
+    def _extract_meta(soup: BeautifulSoup) -> dict:
+        """Extract metadata from ``<head>`` meta / link tags.
+
+        Collects standard, Open Graph (``og:``), Twitter Card (``twitter:``),
+        and article-namespace (``article:``) properties as well as the
+        canonical URL.
+
+        Returns:
+            A flat dict mapping lowercased property/name to content string.
+        """
+        meta: dict = {}
+        for tag in soup.find_all("meta"):
+            name = tag.get("property") or tag.get("name") or ""
+            content = tag.get("content", "")
+            if name and content:
+                meta[name.lower()] = content
+        canonical = soup.find("link", rel="canonical")
+        if canonical:
+            meta["canonical"] = canonical.get("href", "")
+        return meta
 
     def _extract_body(self, soup: BeautifulSoup) -> str:
         """Extract the main body text from an article page."""
@@ -436,7 +484,7 @@ def run_forever(
         on_new_article: Optional callable ``(article: NewsArticle) -> None``
                         invoked for every genuinely new article.
     """
-    scraper = ANCNewsScraper()
+    scraper = ANCNewsScraper(data_lake=data_lake)
     seen_urls: set[str] = set()
     _stop = {"flag": False}
 
@@ -477,6 +525,8 @@ def run_forever(
             if data_lake is not None:
                 try:
                     data_lake.save_raw_article(article)
+                    data_lake.save_preprocessed_article(article)
+                    data_lake.save_cleaned_article(article)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Data lake write failed: %s", exc)
 
