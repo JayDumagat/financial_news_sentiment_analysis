@@ -39,6 +39,12 @@ if TYPE_CHECKING:
     from database import NewsDatabase
     from data_lake import DataLake
 
+# Expose sync_playwright at module level so tests can patch scraper.sync_playwright
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore[import]
+except ImportError:  # pragma: no cover — Playwright absent in minimal envs
+    sync_playwright = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 ANC_URL = "https://www.abs-cbn.com/anc/anc"
@@ -53,8 +59,17 @@ _FALLBACK_UA = (
 
 REQUEST_DELAY = 1.5  # seconds between requests to be polite
 
+# Retry settings for _fetch_html
+_MAX_FETCH_RETRIES = 2  # up to 3 total attempts (initial + 2 retries)
+
+# Maximum pages to follow when paginating a listing URL
+_MAX_LISTING_PAGES = 3
+
 # Regex for ABS-CBN article URL paths (e.g. /anc/business/article/2024/1/15/...)
 _ARTICLE_URL_RE = re.compile(r"/(?:anc|news)/[\w/-]*article/\d{4}/")
+
+# Regex patterns for "next page" link text
+_NEXT_PAGE_RE = re.compile(r"\bnext\b|»|›|→", re.I)
 
 # Maximum number of parent elements to traverse when grouping article links
 _MAX_PARENT_WALK_DEPTH = 4
@@ -89,14 +104,21 @@ class NewsArticle:
     tags: list = field(default_factory=list)
     meta: dict = field(default_factory=dict)
 
+    #: Maximum number of characters returned by :meth:`get_text_for_analysis`.
+    MAX_ANALYSIS_LENGTH: int = field(default=512, init=False, repr=False, compare=False)
+
     def get_text_for_analysis(self) -> str:
-        """Return the best available text for sentiment analysis."""
+        """Return the best available text for sentiment analysis.
+
+        Content is preferred over summary, which is preferred over title.
+        The returned string is truncated to :attr:`MAX_ANALYSIS_LENGTH`
+        characters to stay within model token limits.
+        """
         if self.content:
-            # Truncate to avoid exceeding model token limits
-            return self.content[:512]
+            return self.content[: self.MAX_ANALYSIS_LENGTH]
         if self.summary:
-            return self.summary
-        return self.title
+            return self.summary[: self.MAX_ANALYSIS_LENGTH]
+        return self.title[: self.MAX_ANALYSIS_LENGTH]
 
 
 
@@ -112,11 +134,70 @@ class ANCNewsScraper:
     Uses a headless Chromium browser (Playwright) to render the JavaScript-
     driven ABS-CBN ANC pages before extracting article data.  Run
     ``playwright install chromium`` once after installing the package.
+
+    The scraper can be used as a **context manager** to reuse a single
+    browser instance across all requests, which is significantly faster than
+    launching a new browser for every page::
+
+        with ANCNewsScraper() as scraper:
+            articles = scraper.get_articles()
+            for art in articles:
+                scraper.enrich_article(art)
+
+    When used without a context manager (plain instantiation), a fresh browser
+    is launched and immediately closed for each individual :meth:`_fetch_html`
+    call — behaviour identical to the previous implementation.
     """
 
     def __init__(self, delay: float = REQUEST_DELAY, data_lake=None):
         self.delay = delay
         self.data_lake = data_lake
+        self._browser = None  # set by __enter__ / _open_browser
+        self._playwright = None  # Playwright API handle kept open for reuse
+
+    # ------------------------------------------------------------------
+    # Context-manager support (browser reuse)
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "ANCNewsScraper":
+        self._open_browser()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._close_browser()
+
+    def _open_browser(self) -> None:
+        """Launch a Playwright Chromium browser and keep it open."""
+        if self._browser is not None:
+            return
+        if sync_playwright is None:
+            logger.error(
+                "Playwright is not installed.  "
+                "Run: pip install playwright && playwright install chromium"
+            )
+            return
+        try:
+            self._playwright = sync_playwright().__enter__()
+            self._browser = self._playwright.chromium.launch(headless=True)
+            logger.debug("Playwright browser opened for reuse.")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to open Playwright browser: %s", exc)
+
+    def _close_browser(self) -> None:
+        """Close the shared browser and Playwright handle."""
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._browser = None
+        if self._playwright is not None:
+            try:
+                self._playwright.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+            self._playwright = None
+        logger.debug("Playwright browser closed.")
 
     # ------------------------------------------------------------------
     # Public API
@@ -151,12 +232,18 @@ class ANCNewsScraper:
         Fetch and attach the full body text and head metadata of *article*
         (in-place).
 
+        In addition to ``content`` and ``meta``, this method also:
+
+        * Populates ``article.tags`` from the ``keywords`` meta tag when the
+          tags list is currently empty.
+        * Backfills ``article.published_at`` from the first ``<time>``
+          element found in the article page when the field is not yet set.
+
         Args:
-            article: Article whose ``content`` and ``meta`` fields will be
-                     populated.
+            article: Article whose fields will be populated.
 
         Returns:
-            The same article instance, now with ``content`` and ``meta`` filled.
+            The same article instance, now enriched.
         """
         try:
             time.sleep(self.delay)
@@ -166,6 +253,24 @@ class ANCNewsScraper:
             soup = BeautifulSoup(html, "html.parser")
             article.content = self._extract_body(soup)
             article.meta = self._extract_meta(soup)
+
+            # Populate tags from <meta name="keywords"> when not already set
+            if not article.tags:
+                keywords_str = article.meta.get("keywords", "")
+                if keywords_str:
+                    article.tags = [
+                        kw.strip() for kw in keywords_str.split(",") if kw.strip()
+                    ]
+
+            # Backfill published_at from article page <time> when missing
+            if article.published_at is None:
+                time_tag = soup.find("time")
+                if time_tag:
+                    article.published_at = (
+                        time_tag.get("datetime")
+                        or time_tag.get_text(strip=True)
+                        or None
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch %s: %s", article.url, exc)
         return article
@@ -181,6 +286,14 @@ class ANCNewsScraper:
         content is executed before the DOM is captured.  Returns ``None`` on
         any failure (network error, Playwright not installed, timeout, …).
 
+        **Retry behaviour** — transient failures (network hiccup, timeout) are
+        retried up to :data:`_MAX_FETCH_RETRIES` times with exponential
+        back-off (1 s, 2 s, …) before giving up.
+
+        **Browser reuse** — when the scraper is used as a context manager the
+        same Chromium browser instance is reused across calls; otherwise a
+        temporary browser is launched and closed for this single call.
+
         When a :class:`~data_lake.DataLake` was provided at construction time
         the raw HTML is saved via :meth:`~data_lake.DataLake.save_raw_html`
         before being returned.
@@ -190,36 +303,58 @@ class ANCNewsScraper:
             with patch("scraper.ANCNewsScraper._fetch_html", return_value=html):
                 articles = scraper.get_articles()
         """
-        try:
-            from playwright.sync_api import sync_playwright  # type: ignore[import]
+        # Determine whether a browser is already open (context-manager mode)
+        managed_externally = self._browser is not None
+        if not managed_externally:
+            self._open_browser()
 
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
+        html: Optional[str] = None
+        try:
+            if self._browser is None:
+                # Playwright not available; already logged in _open_browser
+                return None
+
+            for attempt in range(_MAX_FETCH_RETRIES + 1):
                 try:
-                    ctx = browser.new_context(
+                    ctx = self._browser.new_context(
                         user_agent=_get_random_ua(),
                         extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                     )
-                    page = ctx.new_page()
-                    page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-                    # Wait for JS to populate the article list; fall through on
-                    # timeout rather than raising so we still get whatever is there.
                     try:
-                        page.wait_for_load_state("networkidle", timeout=15_000)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    html = page.content()
-                finally:
-                    browser.close()
-        except ImportError:
-            logger.error(
-                "Playwright is not installed.  "
-                "Run: pip install playwright && playwright install chromium"
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Playwright fetch failed for %s: %s", url, exc)
-            return None
+                        page = ctx.new_page()
+                        page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                        # Wait for JS to populate the article list; fall through
+                        # on timeout rather than raising.
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=15_000)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        html = page.content()
+                    finally:
+                        ctx.close()
+                    break  # success — stop retrying
+                except Exception as exc:  # noqa: BLE001
+                    if attempt < _MAX_FETCH_RETRIES:
+                        wait = 2 ** attempt  # 1 s, 2 s
+                        logger.warning(
+                            "Fetch attempt %d/%d failed for %s, retrying in %d s: %s",
+                            attempt + 1,
+                            _MAX_FETCH_RETRIES + 1,
+                            url,
+                            wait,
+                            exc,
+                        )
+                        time.sleep(wait)
+                    else:
+                        logger.error(
+                            "All %d fetch attempts failed for %s: %s",
+                            _MAX_FETCH_RETRIES + 1,
+                            url,
+                            exc,
+                        )
+        finally:
+            if not managed_externally:
+                self._close_browser()
 
         if html and self.data_lake is not None:
             try:
@@ -235,27 +370,73 @@ class ANCNewsScraper:
         max_articles: int,
         exclude_urls: set[str] | None = None,
     ) -> list[NewsArticle]:
-        """Scrape article cards from a listing page."""
+        """Scrape article cards from a listing page, following pagination.
+
+        Follows "next" page links (up to :data:`_MAX_LISTING_PAGES` pages) so
+        that more articles can be collected in a single call when needed.
+        """
         exclude_urls = exclude_urls or set()
         articles: list[NewsArticle] = []
 
-        time.sleep(self.delay)
-        html = self._fetch_html(url)
-        if html is None:
-            logger.error("Failed to fetch listing page %s", url)
-            return articles
+        page_url: Optional[str] = url
+        for _page_num in range(_MAX_LISTING_PAGES):
+            if page_url is None or len(articles) >= max_articles:
+                break
 
-        soup = BeautifulSoup(html, "html.parser")
-        cards = self._find_article_cards(soup)
+            time.sleep(self.delay)
+            html = self._fetch_html(page_url)
+            if html is None:
+                logger.error("Failed to fetch listing page %s", page_url)
+                break
 
-        for card in cards:
+            soup = BeautifulSoup(html, "html.parser")
+            cards = self._find_article_cards(soup)
+
+            for card in cards:
+                if len(articles) >= max_articles:
+                    break
+                article = self._parse_card(card)
+                if article and article.url not in exclude_urls:
+                    articles.append(article)
+                    exclude_urls.add(article.url)
+
             if len(articles) >= max_articles:
                 break
-            article = self._parse_card(card)
-            if article and article.url not in exclude_urls:
-                articles.append(article)
+
+            # Follow pagination only when we still need more articles
+            page_url = self._find_next_page_url(soup, page_url)
 
         return articles
+
+    def _find_next_page_url(
+        self, soup: BeautifulSoup, current_url: str
+    ) -> Optional[str]:
+        """Return the URL of the next listing page, or ``None`` if not found.
+
+        Looks for:
+
+        1. ``<a rel="next">`` — standard HTML pagination hint.
+        2. ``<a>`` whose visible text matches "next", "»", "›", or "→".
+        3. ``<a>`` whose CSS class contains the word *next*.
+        """
+        next_link = (
+            soup.find("a", attrs={"rel": "next"})
+            or soup.find("a", string=lambda t: t and _NEXT_PAGE_RE.search(t))
+            or soup.find(
+                "a",
+                class_=lambda c: c and any(
+                    "next" in cls.lower()
+                    for cls in (c if isinstance(c, list) else c.split())
+                ),
+            )
+        )
+        if next_link and next_link.get("href"):
+            href = next_link["href"]
+            if not href.startswith("http"):
+                href = "https://www.abs-cbn.com" + href
+            if href != current_url:
+                return href
+        return None
 
     def _find_article_cards(self, soup: BeautifulSoup) -> list:
         """Return a list of tag elements that look like article cards.
