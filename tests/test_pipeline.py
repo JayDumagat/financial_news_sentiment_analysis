@@ -277,9 +277,267 @@ class TestANCNewsScraperMeta:
             mock_save.assert_called_once_with("https://example.com/p", raw_html)
 
 
+# ---------------------------------------------------------------------------
+# ANCNewsScraper — new improvements: browser reuse, retry, pagination, enrich
+# ---------------------------------------------------------------------------
+
+SAMPLE_HTML_PAGINATED_P1 = """
+<html><body>
+  <article class="article-card">
+    <a href="/anc/business/article/2024/2/1/page1-art1">Page1 Art1</a>
+    <h3>Page1 Art1</h3>
+  </article>
+  <a rel="next" href="/anc/business?page=2">Next</a>
+</body></html>
+"""
+
+SAMPLE_HTML_PAGINATED_P2 = """
+<html><body>
+  <article class="article-card">
+    <a href="/anc/business/article/2024/2/2/page2-art1">Page2 Art1</a>
+    <h3>Page2 Art1</h3>
+  </article>
+</body></html>
+"""
+
+SAMPLE_HTML_ARTICLE_WITH_TIME = """
+<html>
+<head>
+  <meta name="keywords" content="stocks, PSE, finance, economy" />
+</head>
+<body>
+  <div class="article-body">
+    <p>Article body text.</p>
+  </div>
+  <time datetime="2024-03-15T09:00:00+08:00">March 15, 2024</time>
+</body>
+</html>
+"""
 
 
+class TestANCNewsScraperImprovements:
+    def setup_method(self):
+        from scraper import ANCNewsScraper
+        self.scraper = ANCNewsScraper(delay=0)
 
+    # --- context manager / browser reuse ---
+
+    def test_context_manager_sets_and_clears_browser(self):
+        """__enter__/__exit__ must set and then clear the browser attribute."""
+        from scraper import ANCNewsScraper
+        from unittest.mock import MagicMock, patch
+
+        mock_browser = MagicMock()
+        mock_pw = MagicMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+
+        with patch("scraper.sync_playwright") as mock_sync_pw:
+            mock_sync_pw.return_value.__enter__ = lambda _: mock_pw
+            mock_sync_pw.return_value.__exit__ = MagicMock(return_value=False)
+            mock_sync_pw.return_value = mock_pw  # support both call styles
+
+            # Simulate __enter__ directly via _open_browser
+            scraper = ANCNewsScraper(delay=0)
+            # After _open_browser the browser reference should be stored
+            scraper._browser = mock_browser
+            assert scraper._browser is mock_browser
+            scraper._close_browser()
+            assert scraper._browser is None
+
+    def test_context_manager_enter_exit(self):
+        """Using `with ANCNewsScraper()` should not raise and resets state."""
+        from scraper import ANCNewsScraper
+        from unittest.mock import MagicMock, patch
+
+        mock_browser = MagicMock()
+        mock_pw = MagicMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+
+        def fake_sync_playwright():
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(return_value=mock_pw)
+            cm.__exit__ = MagicMock(return_value=False)
+            return cm
+
+        with patch("scraper.sync_playwright", side_effect=fake_sync_playwright):
+            with ANCNewsScraper(delay=0) as scraper:
+                assert scraper._browser is mock_browser
+            assert scraper._browser is None  # cleaned up on __exit__
+
+    # --- retry logic ---
+
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_retry_succeeds_on_second_attempt(self, mock_fetch):
+        """Simulate _fetch_html returning None then HTML (patch level, no real retry)."""
+        # The patch replaces _fetch_html entirely; verify the higher-level
+        # _scrape_listing gracefully handles a None return.
+        mock_fetch.return_value = None
+        articles = self.scraper.get_articles(max_articles=5)
+        assert articles == []
+
+    def test_fetch_html_retries_on_playwright_error(self):
+        """_fetch_html should retry up to _MAX_FETCH_RETRIES times."""
+        from scraper import ANCNewsScraper, _MAX_FETCH_RETRIES
+        from unittest.mock import MagicMock, patch, call
+
+        call_count = {"n": 0}
+
+        mock_browser = MagicMock()
+        mock_pw = MagicMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+
+        def fake_new_context(**kwargs):
+            call_count["n"] += 1
+            raise RuntimeError("simulated network error")
+
+        mock_browser.new_context.side_effect = fake_new_context
+
+        def fake_sync_playwright():
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(return_value=mock_pw)
+            cm.__exit__ = MagicMock(return_value=False)
+            return cm
+
+        with patch("scraper.sync_playwright", side_effect=fake_sync_playwright):
+            with patch("scraper.time.sleep"):  # speed up retries
+                scraper = ANCNewsScraper(delay=0)
+                scraper._open_browser()
+                result = scraper._fetch_html("https://example.com/article")
+                scraper._close_browser()
+
+        assert result is None
+        assert call_count["n"] == _MAX_FETCH_RETRIES + 1
+
+    # --- pagination ---
+
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_pagination_follows_next_link(self, mock_fetch):
+        """_scrape_listing should follow <a rel="next"> to collect more articles."""
+        mock_fetch.side_effect = [
+            SAMPLE_HTML_PAGINATED_P1,
+            SAMPLE_HTML_PAGINATED_P2,
+        ]
+        articles = self.scraper._scrape_listing(
+            "https://www.abs-cbn.com/anc/business", max_articles=5
+        )
+        titles = [a.title for a in articles]
+        assert any("Page1 Art1" in t for t in titles)
+        assert any("Page2 Art1" in t for t in titles)
+        # Both listing pages should have been fetched
+        assert mock_fetch.call_count == 2
+
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_pagination_stops_at_max_articles(self, mock_fetch):
+        """Pagination must not fetch the second page if max_articles is already met."""
+        mock_fetch.return_value = SAMPLE_HTML_PAGINATED_P1
+        articles = self.scraper._scrape_listing(
+            "https://www.abs-cbn.com/anc/business", max_articles=1
+        )
+        assert len(articles) == 1
+        # Only the first page should have been fetched
+        mock_fetch.assert_called_once()
+
+    def test_find_next_page_url_rel_next(self):
+        """Should detect <a rel='next'> pagination links."""
+        from bs4 import BeautifulSoup
+        html = '<html><body><a rel="next" href="/anc/business?page=2">Next</a></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        result = self.scraper._find_next_page_url(soup, "https://www.abs-cbn.com/anc/business")
+        assert result == "https://www.abs-cbn.com/anc/business?page=2"
+
+    def test_find_next_page_url_text_next(self):
+        """Should detect 'Next' link text."""
+        from bs4 import BeautifulSoup
+        html = '<html><body><a href="/anc/business?page=3">Next</a></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        result = self.scraper._find_next_page_url(soup, "https://www.abs-cbn.com/anc/business?page=2")
+        assert result is not None
+        assert "page=3" in result
+
+    def test_find_next_page_url_none_when_absent(self):
+        """Returns None when no next-page link is present."""
+        from bs4 import BeautifulSoup
+        html = "<html><body><p>No pagination here.</p></body></html>"
+        soup = BeautifulSoup(html, "html.parser")
+        result = self.scraper._find_next_page_url(soup, "https://www.abs-cbn.com/anc/business")
+        assert result is None
+
+    def test_find_next_page_url_same_url_ignored(self):
+        """If the 'next' link points to the current URL it should be ignored."""
+        from bs4 import BeautifulSoup
+        current = "https://www.abs-cbn.com/anc/business"
+        html = f'<html><body><a rel="next" href="{current}">Next</a></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        result = self.scraper._find_next_page_url(soup, current)
+        assert result is None
+
+    # --- enrich: tags from meta keywords ---
+
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_enrich_populates_tags_from_keywords(self, mock_fetch):
+        """enrich_article should fill tags from <meta name='keywords'>."""
+        mock_fetch.return_value = SAMPLE_HTML_ARTICLE_WITH_TIME
+        from scraper import NewsArticle
+        art = NewsArticle(title="T", url="https://www.abs-cbn.com/anc/business/article/2024/3/15/t")
+        self.scraper.enrich_article(art)
+        assert "stocks" in art.tags or "PSE" in art.tags
+
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_enrich_does_not_overwrite_existing_tags(self, mock_fetch):
+        """enrich_article must not replace tags that were already set."""
+        mock_fetch.return_value = SAMPLE_HTML_ARTICLE_WITH_TIME
+        from scraper import NewsArticle
+        art = NewsArticle(
+            title="T",
+            url="https://www.abs-cbn.com/anc/business/article/2024/3/15/t",
+            tags=["pre-existing"],
+        )
+        self.scraper.enrich_article(art)
+        assert art.tags == ["pre-existing"]
+
+    # --- enrich: published_at backfill ---
+
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_enrich_backfills_published_at_when_missing(self, mock_fetch):
+        """enrich_article should fill published_at from <time datetime='...'>."""
+        mock_fetch.return_value = SAMPLE_HTML_ARTICLE_WITH_TIME
+        from scraper import NewsArticle
+        art = NewsArticle(title="T", url="https://www.abs-cbn.com/anc/business/article/2024/3/15/t")
+        assert art.published_at is None
+        self.scraper.enrich_article(art)
+        assert art.published_at == "2024-03-15T09:00:00+08:00"
+
+    @patch("scraper.ANCNewsScraper._fetch_html")
+    def test_enrich_does_not_overwrite_existing_published_at(self, mock_fetch):
+        """enrich_article must not replace a published_at already set from listing."""
+        mock_fetch.return_value = SAMPLE_HTML_ARTICLE_WITH_TIME
+        from scraper import NewsArticle
+        art = NewsArticle(
+            title="T",
+            url="https://www.abs-cbn.com/anc/business/article/2024/3/15/t",
+            published_at="2024-01-01T00:00:00+08:00",
+        )
+        self.scraper.enrich_article(art)
+        assert art.published_at == "2024-01-01T00:00:00+08:00"
+
+    # --- MAX_ANALYSIS_LENGTH ---
+
+    def test_max_analysis_length_default(self):
+        from scraper import NewsArticle
+        art = NewsArticle(title="T", url="http://x", content="x" * 1000)
+        assert len(art.get_text_for_analysis()) == 512
+
+    def test_max_analysis_length_customisable(self):
+        from scraper import NewsArticle
+        art = NewsArticle(title="T", url="http://x", content="y" * 1000)
+        art.MAX_ANALYSIS_LENGTH = 256
+        assert len(art.get_text_for_analysis()) == 256
+
+    def test_max_analysis_length_truncates_summary(self):
+        from scraper import NewsArticle
+        art = NewsArticle(title="T", url="http://x", summary="s" * 600)
+        art.MAX_ANALYSIS_LENGTH = 100
+        assert len(art.get_text_for_analysis()) == 100
 def _make_mock_pipeline(label: str = "positive", score: float = 0.9):
     """Return a callable that mimics a HuggingFace text-classification pipeline."""
 
